@@ -1,0 +1,191 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (staging or production)"
+        required: true
+        type: string
+      tag_name:
+        description: "Release tag holding the artifact"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      tag_name:
+        description: "Release tag holding the artifact (redeploy)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  DEPLOY_ENV: ${{ inputs.environment }}
+  TAG_NAME: ${{ inputs.tag_name }}
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+      issues: write
+      pull-requests: write
+    # configure required reviewers on the production environment
+    environment:
+      name: ${{ inputs.environment }}
+    steps:
+      - name: Checkout local actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          case "${DEPLOY_ENV}" in staging|production) ;; *) echo "::error::Unknown environment ${DEPLOY_ENV}"; exit 1 ;; esac
+          [[ "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::Invalid tag ${TAG_NAME}"; exit 1; }
+
+      - name: Download and verify release artifact
+        id: artifact-download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" -D dist \
+            --pattern 'release_*.tar.gz' --pattern 'release_*.tar.gz.sha256'
+          cd dist
+          sha256sum -c ./*.sha256
+          asset="$(basename ./*.tar.gz)"
+          gh attestation verify "${asset}" --repo "${GITHUB_REPOSITORY}"
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=$(cut -d' ' -f1 "${asset}.sha256")" >> "${GITHUB_OUTPUT}"
+
+      # AWS: OIDC role, no stored keys. S3-compatible (Hetzner, MinIO): scoped keys,
+      # exported only inside the upload step.
+      - name: Configure AWS credentials (OIDC)
+        if: ${{ vars.AWS_ROLE_ARN != '' }}
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload artifact to S3 storage
+        id: artifact-upload-to-s3
+        env:
+          USE_OIDC: ${{ vars.AWS_ROLE_ARN != '' }}
+          S3_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          S3_REGION: ${{ vars.AWS_REGION }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
+          ASSET: ${{ steps.artifact-download.outputs.asset }}
+        run: |
+          if [ "${USE_OIDC}" != "true" ]; then
+            export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY}" AWS_REGION="${S3_REGION}"
+          fi
+          endpoint=()
+          [ -n "${S3_ENDPOINT}" ] && endpoint=(--endpoint-url "${S3_ENDPOINT}")
+          aws "${endpoint[@]}" s3 cp "dist/${ASSET}" "s3://${S3_BUCKET}/releases/${ASSET}"
+          aws "${endpoint[@]}" s3 cp "dist/${ASSET}.sha256" "s3://${S3_BUCKET}/releases/${ASSET}.sha256"
+
+      # python, nginx, redis, rabbitmq event trigger for hetzner.
+      # in aws use s3 events with eventbridge, lambda, ssm.
+      - name: Trigger signed deployment webhook
+        id: deployment-webhook
+        env:
+          ASSET: ${{ steps.artifact-download.outputs.asset }}
+          SHA256: ${{ steps.artifact-download.outputs.sha256 }}
+          DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
+          DEPLOY_WEBHOOK_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
+          SIGNATURE_HMAC_KEY: ${{ secrets.SIGNATURE_HMAC_KEY }}
+          # keep above deputy deployment_timeout_seconds (default 900)
+          WEBHOOK_TIMEOUT: ${{ vars.DEPLOY_WEBHOOK_TIMEOUT || '960' }}
+        run: |
+          timestamp="$(date -u +%s)"
+          jq -cn \
+            --arg environment "${DEPLOY_ENV}" \
+            --arg tag_name "${TAG_NAME}" \
+            --arg artifact_name "${ASSET}" \
+            --arg artifact_digest "sha256:${SHA256}" \
+            --argjson timestamp "${timestamp}" \
+            '{environment: $environment, tag_name: $tag_name, artifact_name: $artifact_name, artifact_digest: $artifact_digest, timestamp: $timestamp}' \
+            | tr -d '\n' > payload.json
+          signature="$(openssl dgst -sha256 -hmac "${SIGNATURE_HMAC_KEY}" -r < payload.json | cut -d' ' -f1)"
+          headers=(-H "Content-Type: application/json" -H "X-Signature: sha256=${signature}" -H "X-Timestamp: ${timestamp}")
+          # magenx-deputy-go requires both shared secret and HMAC signature
+          [ -n "${DEPLOY_WEBHOOK_SECRET}" ] && headers+=(-H "X-Webhook-Secret: ${DEPLOY_WEBHOOK_SECRET}")
+          # magenx-deputy-go deploys synchronously: response comes after deploy + health check.
+          # No retries: a retry would start a second deployment.
+          curl -sS --fail-with-body --max-time "${WEBHOOK_TIMEOUT}" \
+            -X POST "${headers[@]}" --data-binary @payload.json "${DEPLOY_WEBHOOK_URL}"
+
+      - name: Deployment status message
+        id: deployment-status-comment
+        if: ${{ !cancelled() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          DOWNLOAD: ${{ steps.artifact-download.outcome }}
+          UPLOAD: ${{ steps.artifact-upload-to-s3.outcome }}
+          WEBHOOK: ${{ steps.deployment-webhook.outcome }}
+          ASSET: ${{ steps.artifact-download.outputs.asset }}
+        run: |
+          declare -A step_icons=( ["success"]="✔️" ["failure"]="❌" ["skipped"]="➖" ["cancelled"]="✖️" [""]="➖" )
+          row() { echo "${step_icons[$2]} $1: ${2:-skipped}"; }
+          {
+            echo "## ⚠️ ${DEPLOY_ENV} release ${TAG_NAME} deployment status: ${JOB_STATUS}"
+            row "Download and verify artifact (sha256, attestation)" "${DOWNLOAD}"
+            row "Upload artifact to S3 storage" "${UPLOAD}"
+            row "Deployment event webhook trigger" "${WEBHOOK}"
+            echo
+            echo "- **ARTIFACT**: \`${ASSET}\`"
+            echo "- **RUN**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- **DATE**: $(date -u +%Y-%m-%d-%H:%M) UTC"
+          } > "${RUNNER_TEMP}/deployment.md"
+          cat "${RUNNER_TEMP}/deployment.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Add deployment status to release PR
+        if: ${{ inputs.environment == 'staging' && !cancelled() }}
+        uses: ./.github/actions/release-pr-comment
+        with:
+          body-file: ${{ runner.temp }}/deployment.md
+          prerelease-type: ${{ vars.PRERELEASE_TYPE || 'alpha' }}
+
+      - name: Production deployment issue
+        if: ${{ inputs.environment == 'production' && !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+          ASSET: ${{ steps.artifact-download.outputs.asset }}
+          ASSIGNEE: ${{ vars.DEPLOY_ISSUE_ASSIGNEE }}
+        run: |
+          title="Production release deployment status"
+          gh issue list --repo "${GITHUB_REPOSITORY}" --label "release" --state open \
+            --search "${title} in:title" --json number,title \
+            --jq ".[] | select(.title | startswith(\"${title}\")) | .number" \
+          | while read -r issue; do
+              gh issue close "${issue}" --repo "${GITHUB_REPOSITORY}" --reason "not planned" \
+                --comment "new deployment [${ASSET}]"
+            done
+          gh label create "deployment: ${JOB_STATUS}" --repo "${GITHUB_REPOSITORY}" --force > /dev/null
+          gh label create "release" --repo "${GITHUB_REPOSITORY}" --force > /dev/null
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "${title} ${TAG_NAME} [${JOB_STATUS}]" \
+            --body-file "${RUNNER_TEMP}/deployment.md" \
+            --label "deployment: ${JOB_STATUS}" \
+            --label "release" \
+            ${ASSIGNEE:+--assignee "${ASSIGNEE}"}

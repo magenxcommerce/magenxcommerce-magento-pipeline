@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PHP_VERSION: ${{ vars.PHP_VERSION || '8.3' }}
+
+jobs:
+  changes:
+    name: Detect changes
+    if: "${{ !(startsWith(github.head_ref, 'release-please') && contains(github.event.pull_request.labels.*.name, 'autorelease: pending')) }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      php: ${{ steps.filter.outputs.php }}
+      php_files: ${{ steps.filter.outputs.php_files }}
+      composer: ${{ steps.filter.outputs.composer }}
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          list-files: json
+          filters: |
+            php:
+              - added|modified: '**/*.php'
+            composer:
+              - 'composer.json'
+              - 'composer.lock'
+            code:
+              - 'app/code/**'
+              - 'app/etc/config.php'
+              - 'patches/**'
+              - 'composer.json'
+              - 'composer.lock'
+
+  composer:
+    name: Composer validate and audit
+    needs: changes
+    if: ${{ needs.changes.outputs.composer == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP and Composer
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      - name: Validate composer.json and lock freshness
+        run: composer validate --no-check-all --no-check-publish
+
+      - name: Audit locked packages
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        run: composer audit --locked --no-interaction
+
+  lint:
+    name: PHP lint and coding standard
+    needs: changes
+    if: ${{ needs.changes.outputs.php == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP and Composer
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          tools: composer:v2, cs2pr
+
+      - name: Install Magento coding standard
+        run: |
+          composer global config --no-interaction allow-plugins.dealerdirect/phpcodesniffer-composer-installer true
+          composer global require --no-interaction --no-progress \
+            dealerdirect/phpcodesniffer-composer-installer magento/magento-coding-standard
+          echo "$(composer global config home)/vendor/bin" >> "${GITHUB_PATH}"
+
+      - name: PHP syntax check
+        env:
+          PHP_FILES: ${{ needs.changes.outputs.php_files }}
+        run: |
+          jq -r '.[]' <<< "${PHP_FILES}" | xargs -r -d '\n' -n 1 -P "$(nproc)" php -l -d display_errors=1 > /dev/null
+
+      - name: Magento2 coding standard on app/code
+        env:
+          PHP_FILES: ${{ needs.changes.outputs.php_files }}
+        run: |
+          mapfile -t files < <(jq -r '.[] | select(startswith("app/code/"))' <<< "${PHP_FILES}")
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No changed PHP files in app/code"
+            exit 0
+          fi
+          phpcs --standard=Magento2 --severity=10 --report=checkstyle "${files[@]}" | cs2pr
+
+  compile:
+    name: Magento compile and tests
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP and Composer
+        id: setup
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          composer-auth: ${{ secrets.COMPOSER_AUTH }}
+          install-args: "--no-ansi --no-interaction --no-progress"
+
+      - name: Magento setup:di:compile
+        uses: ./.github/actions/magento-build
+
+      - name: PHPStan
+        run: |
+          if [ -f phpstan.neon ] || [ -f phpstan.neon.dist ]; then
+            vendor/bin/phpstan analyse --no-progress --error-format=github
+          else
+            echo "No phpstan.neon(.dist), skipped"
+          fi
+
+      - name: Unit tests for app/code
+        run: |
+          if compgen -G "app/code/*/*/Test/Unit" > /dev/null; then
+            vendor/bin/phpunit -c dev/tests/unit/phpunit.xml.dist app/code
+          else
+            echo "No unit tests in app/code, skipped"
+          fi

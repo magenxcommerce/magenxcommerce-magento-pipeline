@@ -1,0 +1,176 @@
+name: Build
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+concurrency:
+  group: build-${{ github.event.release.tag_name }}
+
+env:
+  PHP_VERSION: ${{ vars.PHP_VERSION || '8.3' }}
+  TAG_NAME: ${{ github.event.release.tag_name }}
+
+jobs:
+  build:
+    name: Build release artifact
+    if: ${{ github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      pull-requests: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TAG_NAME }}
+          persist-credentials: false
+
+      - name: Setup PHP and Composer install
+        id: setup
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: ${{ vars.PHP_EXTENSIONS || 'bcmath, ctype, curl, dom, fileinfo, gd, hash, iconv, intl, mbstring, openssl, pdo_mysql, simplexml, soap, sockets, sodium, spl, xmlwriter, xsl, zip' }}
+          composer-auth: ${{ secrets.COMPOSER_AUTH }}
+          install-args: "--no-dev --no-ansi --no-interaction --no-progress"
+
+      - name: Magento headless build
+        id: compile
+        uses: ./.github/actions/magento-build
+        with:
+          composer_autoload: "--no-dev --optimize --classmap-authoritative"
+          # admin area + Magento/blank (transactional email CSS), no storefront theme
+          static_content_deploy: ${{ vars.STATIC_DEPLOY_ARGS || '-f -n --no-ansi --area adminhtml --area frontend --theme Magento/backend --theme Magento/blank' }}
+          static_content_locales: ${{ vars.STATIC_DEPLOY_LOCALES || 'en_US' }}
+
+      - name: Security scan
+        id: security-scan
+        uses: ./.github/actions/security-scan
+        with:
+          ecomscan_key: ${{ secrets.ECOMSCAN_KEY }}
+          ecomscan_sha256: ${{ vars.ECOMSCAN_SHA256 }}
+
+      - name: Package artifact
+        id: package
+        env:
+          SCAN_REPORT: ${{ steps.security-scan.outputs.report }}
+        run: |
+          version="${TAG_NAME%%-*}"
+          asset="release_${version}_$(git rev-parse --short HEAD).tar.gz"
+          mkdir -p "${RUNNER_TEMP}/dist"
+          tar -czf "${RUNNER_TEMP}/dist/${asset}" \
+            --exclude-vcs \
+            --exclude="./.github" \
+            --exclude="./app/etc/env.php" \
+            --exclude="./auth.json" \
+            --exclude="./CHANGELOG.md" \
+            --exclude="./dev/tests" \
+            --exclude="./node_modules" \
+            --exclude="./pub/media/*" \
+            --exclude="./var/*" \
+            .
+          ( cd "${RUNNER_TEMP}/dist" && sha256sum "${asset}" > "${asset}.sha256" )
+          if [ -n "${SCAN_REPORT}" ]; then
+            cp "${SCAN_REPORT}" "${RUNNER_TEMP}/dist/security_scan_${TAG_NAME}.log"
+          fi
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+          echo "sha256=$(cut -d' ' -f1 "${RUNNER_TEMP}/dist/${asset}.sha256")" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/dist/${{ steps.package.outputs.asset }}
+          create-storage-record: false
+
+      - name: Upload artifact to pre-release
+        id: upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${TAG_NAME}" "${RUNNER_TEMP}"/dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+      - name: Build status message
+        if: ${{ !cancelled() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          COMPOSER_INSTALL: ${{ steps.setup.outputs.composer-install }}
+          DI_COMPILE: ${{ steps.compile.outputs.setup_di_compile }}
+          AUTOLOAD: ${{ steps.compile.outputs.composer_autoload }}
+          STATIC_DEPLOY: ${{ steps.compile.outputs.static_content_deploy }}
+          SANITY: ${{ steps.compile.outputs.sanity }}
+          SCAN: ${{ steps.security-scan.outcome }}
+          PACKAGE: ${{ steps.package.outcome }}
+          ATTEST: ${{ steps.attest.outcome }}
+          UPLOAD: ${{ steps.upload.outcome }}
+          ASSET: ${{ steps.package.outputs.asset }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          declare -A job_icons=( ["success"]="🟢" ["failure"]="🔴" ["cancelled"]="⚫" )
+          declare -A step_icons=( ["success"]="✔️" ["failure"]="❌" ["skipped"]="➖" ["cancelled"]="✖️" [""]="➖" )
+          row() { echo "${step_icons[$2]} $1: ${2:-skipped}"; }
+          {
+            echo "${job_icons[${JOB_STATUS}]} BUILD STATUS ${TAG_NAME}: ${JOB_STATUS}"
+            echo
+            row "Composer install" "${COMPOSER_INSTALL}"
+            row "Code compilation" "${DI_COMPILE}"
+            row "Composer autoload" "${AUTOLOAD}"
+            row "Static content deploy (adminhtml, email)" "${STATIC_DEPLOY}"
+            row "bin/magento sanity" "${SANITY}"
+            row "Security scan" "${SCAN}"
+            row "Package artifact" "${PACKAGE}"
+            row "Build provenance attestation" "${ATTEST}"
+            row "Upload to pre-release" "${UPLOAD}"
+            if [ "${JOB_STATUS}" = "success" ]; then
+              echo
+              echo "## Build and artifact details:"
+              echo "- **ARTIFACT**: \`${ASSET}\`"
+              echo "- **SHA256**: \`${SHA256}\`"
+              echo "- **RELEASE**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG_NAME}"
+              echo "- **ATTESTATION**: ${ATTESTATION_URL}"
+              echo "- **RUN**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            fi
+            echo
+            echo "@${GITHUB_REPOSITORY_OWNER} Please review this PR."
+          } > "${RUNNER_TEMP}/comment.md"
+          cat "${RUNNER_TEMP}/comment.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Add status to release PR
+        if: ${{ !cancelled() }}
+        uses: ./.github/actions/release-pr-comment
+        with:
+          body-file: ${{ runner.temp }}/comment.md
+          prerelease-type: ${{ vars.PRERELEASE_TYPE || 'alpha' }}
+
+  deploy-staging:
+    name: Deploy to staging
+    needs: build
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: staging
+      tag_name: ${{ github.event.release.tag_name }}
+    secrets: inherit
+
+  post-deploy:
+    name: Post-deploy API checks
+    needs: deploy-staging
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/post_deploy.yml
+    with:
+      environment: staging
+      tag_name: ${{ github.event.release.tag_name }}
+    secrets: inherit

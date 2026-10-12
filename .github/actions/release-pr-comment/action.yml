@@ -1,0 +1,49 @@
+name: "Comment on release PR"
+author: "MagenX"
+description: "Find the open release-please production release PR and post a comment from a file."
+
+inputs:
+  body-file:
+    description: "Markdown file with comment body"
+    required: true
+  prerelease-type:
+    description: "Prerelease identifier used in pre-release PR titles (alpha, beta, rc)"
+    required: false
+    default: "alpha"
+  github-token:
+    description: "Token with pull-requests: write"
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  pr-number:
+    description: "Release PR number, empty if none open"
+    value: ${{ steps.find-pr.outputs.pr_number }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Find release PR
+      id: find-pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PRERELEASE_TYPE: ${{ inputs.prerelease-type }}
+      run: |
+        pr_number="$(gh pr list \
+          --repo "${GITHUB_REPOSITORY}" \
+          --state open \
+          --label "autorelease: pending" \
+          --json number,title \
+          --jq "[.[] | select(.title | contains(\"-${PRERELEASE_TYPE}\") | not)] | first | .number // empty")"
+        echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+        [ -n "${pr_number}" ] || echo "::notice::No open release PR found, comment skipped"
+
+    - name: Post comment
+      if: ${{ steps.find-pr.outputs.pr_number != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR_NUMBER: ${{ steps.find-pr.outputs.pr_number }}
+        BODY_FILE: ${{ inputs.body-file }}
+      run: gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file "${BODY_FILE}"

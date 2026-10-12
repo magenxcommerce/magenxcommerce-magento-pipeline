@@ -1,0 +1,106 @@
+name: Upgrade Magento to latest version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target magento/product-community-edition version (empty = latest stable)"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: upgrade-magento
+
+env:
+  PHP_VERSION: ${{ vars.PHP_VERSION || '8.3' }}
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # App token: PR opened by GITHUB_TOKEN would not run required checks
+      - name: Create GitHub App token
+        id: app-token
+        if: ${{ vars.CI_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Setup PHP and Composer install
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          composer-auth: ${{ secrets.COMPOSER_AUTH }}
+          install-args: "--no-interaction --no-progress"
+
+      - name: Resolve versions
+        id: version
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+          TARGET: ${{ inputs.version }}
+        run: |
+          current="$(composer show magento/product-community-edition --locked --format=json | jq -r '.versions[0]')"
+          if [ -z "${TARGET}" ]; then
+            TARGET="$(composer show magento/product-community-edition --all --format=json \
+              | jq -r '[.versions[] | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+(-p[0-9]+)?$"))] | first')"
+          fi
+          echo "current=${current} target=${TARGET}"
+          if [ "${current}" = "${TARGET}" ]; then
+            echo "::notice::Already on magento/product-community-edition ${current}"
+            exit 0
+          fi
+          branch="upgrade/magento-${TARGET}"
+          if git ls-remote --exit-code --heads origin "${branch}" > /dev/null; then
+            echo "::notice::Branch ${branch} already exists, upgrade PR pending"
+            exit 0
+          fi
+          {
+            echo "current=${current}"
+            echo "target=${TARGET}"
+            echo "branch=${branch}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upgrade
+        if: ${{ steps.version.outputs.target != '' }}
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+          TARGET: ${{ steps.version.outputs.target }}
+        run: |
+          if composer list --raw | grep -q '^require-commerce '; then
+            composer require-commerce "magento/product-community-edition=${TARGET}" --no-update --no-interaction
+          else
+            composer require "magento/product-community-edition:${TARGET}" --no-update
+          fi
+          composer update -W --no-interaction --no-progress
+
+      - name: Create upgrade PR
+        if: ${{ steps.version.outputs.target != '' }}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          CURRENT: ${{ steps.version.outputs.current }}
+          TARGET: ${{ steps.version.outputs.target }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add composer.json composer.lock
+          [ -f app/etc/config.php ] && git add app/etc/config.php
+          git commit -m "feat(upgrade)!: Upgrade Magento to ${TARGET}"
+          git push origin "${BRANCH}"
+          gh pr create --repo "${GITHUB_REPOSITORY}" \
+            --base main --head "${BRANCH}" \
+            --title "feat(upgrade)!: Upgrade Magento to ${TARGET}" \
+            --body "Upgrade magento/product-community-edition ${CURRENT} → ${TARGET} (PHP ${PHP_VERSION}). Review release notes and patches before merge."

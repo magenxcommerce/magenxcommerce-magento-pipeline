@@ -1,0 +1,22 @@
+name: PR labeler
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+
+permissions: {}
+
+jobs:
+  labeler:
+    name: PR labeler
+    if: "${{ !(startsWith(github.head_ref, 'release-please') && contains(github.event.pull_request.labels.*.name, 'autorelease: pending')) }}"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # no checkout: labeler reads .github/labeler.yml from base branch
+      - uses: actions/labeler@f27b608878404679385c85cfa523b85ccb86e213 # v6.1.0
