@@ -1,0 +1,82 @@
+name: Promote release artifact
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Production release tag (vX.Y.Z)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: promote-${{ inputs.tag_name || github.event.release.tag_name }}
+
+env:
+  TAG_NAME: ${{ inputs.tag_name || github.event.release.tag_name }}
+
+jobs:
+  promote:
+    name: Promote pre-release artifact
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - name: Find matching pre-release
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release tag: ${TAG_NAME}"
+            exit 1
+          fi
+          prerelease="$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 200 \
+            --json tagName,isPrerelease,createdAt \
+            --jq "[.[] | select(.isPrerelease and (.tagName | startswith(\"${TAG_NAME}-\")))] | sort_by(.createdAt) | last | .tagName // empty")"
+          if [ -z "${prerelease}" ]; then
+            echo "::error::No pre-release found for ${TAG_NAME}"
+            exit 1
+          fi
+          echo "Promoting ${prerelease} -> ${TAG_NAME}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download and verify pre-release artifact
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ steps.find.outputs.prerelease }}
+        run: |
+          mkdir -p dist
+          gh release download "${PRERELEASE}" --repo "${GITHUB_REPOSITORY}" -D dist \
+            --pattern 'release_*.tar.gz' --pattern 'release_*.tar.gz.sha256'
+          cd dist
+          sha256sum -c ./*.sha256
+          asset="$(basename ./*.tar.gz)"
+          gh attestation verify "${asset}" --repo "${GITHUB_REPOSITORY}"
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attach same artifact to production release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${TAG_NAME}" dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+
+  deploy-production:
+    name: Deploy to production
+    needs: promote
+    permissions:
+      contents: read
+      id-token: write
+      attestations: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      environment: production
+      tag_name: ${{ inputs.tag_name || github.event.release.tag_name }}
+    secrets: inherit

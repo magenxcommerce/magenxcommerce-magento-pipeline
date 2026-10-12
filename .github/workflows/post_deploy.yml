@@ -1,0 +1,132 @@
+name: Post-deploy API checks
+
+# Deploy is asynchronous (webhook). The deploy server calls back when done:
+#   POST /repos/{owner}/{repo}/dispatches
+#   {"event_type":"deployment_completed","client_payload":{"environment":"staging","tag_name":"v1.2.0-alpha.1"}}
+on:
+  repository_dispatch:
+    types: [deployment_completed]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to check"
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+
+permissions: {}
+
+concurrency:
+  group: post-deploy-${{ inputs.environment || github.event.client_payload.environment }}
+  cancel-in-progress: true
+
+env:
+  DEPLOY_ENV: ${{ inputs.environment || github.event.client_payload.environment }}
+  TAG_NAME: ${{ github.event.client_payload.tag_name }}
+
+jobs:
+  smoke:
+    name: GraphQL and REST smoke test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    outputs:
+      graphql_url: ${{ steps.target.outputs.graphql_url }}
+    steps:
+      - name: Checkout local actions
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+
+      - name: Resolve target
+        id: target
+        env:
+          GRAPHQL_URL_STAGING: ${{ vars.GRAPHQL_URL_STAGING }}
+          GRAPHQL_URL_PRODUCTION: ${{ vars.GRAPHQL_URL_PRODUCTION }}
+        run: |
+          case "${DEPLOY_ENV}" in
+            staging) url="${GRAPHQL_URL_STAGING}" ;;
+            production) url="${GRAPHQL_URL_PRODUCTION}" ;;
+            *) echo "::error::Unknown environment ${DEPLOY_ENV}"; exit 1 ;;
+          esac
+          [ -n "${url}" ] || { echo "::error::GRAPHQL_URL_${DEPLOY_ENV^^} variable not set"; exit 1; }
+          echo "graphql_url=${url}" >> "${GITHUB_OUTPUT}"
+
+      - name: GraphQL smoke query
+        id: graphql
+        env:
+          GRAPHQL_URL: ${{ steps.target.outputs.graphql_url }}
+          QUERY: ${{ vars.GRAPHQL_SMOKE_QUERY || '{ storeConfig { store_code base_currency_code } }' }}
+          STORE_CODE: ${{ vars.STORE_CODE || 'default' }}
+        run: |
+          jq -cn --arg query "${QUERY}" '{query: $query}' > query.json
+          curl -sS --fail-with-body --retry 5 --retry-all-errors --retry-delay 10 --max-time 30 \
+            -H "Content-Type: application/json" -H "Store: ${STORE_CODE}" \
+            --data-binary @query.json "${GRAPHQL_URL}" -o response.json
+          jq . response.json
+          if jq -e '.errors // empty | length > 0' response.json > /dev/null || ! jq -e '.data' response.json > /dev/null; then
+            echo "::error::GraphQL smoke query returned errors"
+            exit 1
+          fi
+
+      - name: REST smoke request
+        id: rest
+        if: ${{ vars.REST_SMOKE_PATH != '' }}
+        env:
+          GRAPHQL_URL: ${{ steps.target.outputs.graphql_url }}
+          REST_SMOKE_PATH: ${{ vars.REST_SMOKE_PATH }}
+        run: |
+          base="${GRAPHQL_URL%/graphql}"
+          curl -sS --fail-with-body --retry 3 --retry-all-errors --max-time 30 "${base}${REST_SMOKE_PATH}" | jq .
+
+      - name: Smoke status message
+        if: ${{ !cancelled() }}
+        env:
+          JOB_STATUS: ${{ job.status }}
+          GRAPHQL: ${{ steps.graphql.outcome }}
+          REST: ${{ steps.rest.outcome }}
+        run: |
+          declare -A step_icons=( ["success"]="✔️" ["failure"]="❌" ["skipped"]="➖" ["cancelled"]="✖️" [""]="➖" )
+          {
+            echo "## ${DEPLOY_ENV} ${TAG_NAME} API smoke test: ${JOB_STATUS}"
+            echo "${step_icons[${GRAPHQL}]} GraphQL query: ${GRAPHQL:-skipped}"
+            echo "${step_icons[${REST}]} REST request: ${REST:-skipped}"
+            echo
+            echo "- **RUN**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "${RUNNER_TEMP}/smoke.md"
+          cat "${RUNNER_TEMP}/smoke.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Add smoke status to release PR
+        if: ${{ env.DEPLOY_ENV == 'staging' && !cancelled() }}
+        uses: ./.github/actions/release-pr-comment
+        with:
+          body-file: ${{ runner.temp }}/smoke.md
+          prerelease-type: ${{ vars.PRERELEASE_TYPE || 'alpha' }}
+
+  zap-scan:
+    name: ZAP GraphQL API scan
+    needs: smoke
+    # active scan, staging only
+    if: ${{ needs.smoke.outputs.graphql_url != '' && (inputs.environment || github.event.client_payload.environment) == 'staging' && vars.ZAP_SCAN_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout ZAP rules
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: ZAP API scan
+        uses: zaproxy/action-api-scan@5158fe4d9d8fcc75ea204db81317cce7f9e5453d # v0.10.0
+        with:
+          target: ${{ needs.smoke.outputs.graphql_url }}
+          format: graphql
+          cmd_options: "-l WARN"
+          issue_title: "ZAP GraphQL API Scan Report"

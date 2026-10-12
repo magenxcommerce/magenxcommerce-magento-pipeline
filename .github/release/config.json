@@ -1,0 +1,56 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "changelog-sections": [
+    {
+      "type": "feat",
+      "section": "🚀 Features"
+    },
+    {
+      "type": "fix",
+      "section": "🐛 Bug Fixes"
+    },
+    {
+      "type": "perf",
+      "section": "⚡ Performance"
+    },
+    {
+      "type": "refactor",
+      "section": "🛠️ Refactoring"
+    },
+    {
+      "type": "docs",
+      "section": "📝 Documentation"
+    },
+    {
+      "type": "chore",
+      "section": "🚦 Maintenance"
+    },
+    {
+      "type": "revert",
+      "section": "⏪ Reverts"
+    },
+    {
+      "type": "default",
+      "section": "Other Changes"
+    }
+  ],
+  "packages": {
+    ".": {
+      "component": "magenxcommerce",
+      "release-type": "simple",
+      "prerelease": false,
+      "pull-request-title-pattern": "chore${scope}: magenxcommerce ${version}",
+      "pull-request-header": ":robot: I have created a [ release ]",
+      "include-v-in-tag": true,
+      "include-component-in-tag": false,
+      "always-update": true,
+      "extra-files": [
+        {
+          "type": "json",
+          "path": ".github/release/prerelease-manifest.json",
+          "jsonpath": "$[\".\"]"
+        }
+      ]
+    }
+  }
+}
