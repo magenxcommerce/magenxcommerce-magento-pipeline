@@ -34,6 +34,18 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
           after each deploy ──► post_deploy.yml: GraphQL/REST smoke test, ZAP API scan (staging)
 ```
 
+### How the two release-please configs interact
+
+- Every push to `main` runs release-please with `prerelease-config.json`: it opens/updates the
+  **pre-release PR** (`X.Y.Z-alpha.N`). Merging it tags `vX.Y.Z-alpha.N` as a GitHub pre-release.
+- Only right after such a pre-release tag, release-please runs with `config.json` and opens/updates the
+  **release PR** (`X.Y.Z`). Its `extra-files` also writes the version into `prerelease-manifest.json`.
+- Merging the release PR pushes to `main`; the pre-release job picks it up (same `autorelease: pending`
+  label and title pattern) and tags it `vX.Y.Z`. release-please marks a GitHub release as pre-release only
+  when the version has a pre-release suffix or major is `0`, so `vX.Y.Z` is a full release and triggers
+  `promote.yml`. Keep versions at `1.0.0` or above, otherwise production never deploys.
+- `PRERELEASE_TYPE` must match `prerelease-type` in `prerelease-config.json`.
+
 ## Workflows
 
 | Workflow | Trigger | Purpose |
@@ -42,7 +54,7 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
 | `composer_require.yml` | PR touching composer files | sync `composer.lock` for added/changed/removed packages, full update on Magento version change, enable new modules in `config.php`, push back, sticky report comment |
 | `pr_title_validate.yml` | PR | Conventional Commit title, uppercase subject |
 | `labeler.yml` | PR | path labels (graphql, webapi, db schema, composer, ...) |
-| `copilot_pr_review.yml` | PR | request Copilot review (opt-in) |
+| `copilot_pr_review.yml` | PR | request Copilot review (on by default, `COPILOT_REVIEW_ENABLED=false` disables) |
 | `release.yml` | push to main | release-please pre-release PR/tag, then release PR |
 | `build.yml` | pre-release published | build once, attest, attach artifact, deploy staging |
 | `promote.yml` | release published / manual | reuse verified pre-release artifact, deploy production |
@@ -65,7 +77,7 @@ repository with **Contents**, **Issues**, **Pull requests**: read and write.
 - variable `CI_APP_CLIENT_ID`, secret `CI_APP_PRIVATE_KEY`
 
 Fallback without an App: fine-grained PAT (Contents, Issues, Pull requests: read and write, this
-repository only) in secret `RELEASE_GITHUB_TOKEN` (used by `release.yml` only).
+repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeline, used by `release.yml` only).
 
 ### Variables
 
@@ -78,7 +90,7 @@ repository only) in secret `RELEASE_GITHUB_TOKEN` (used by `release.yml` only).
 | `STATIC_DEPLOY_LOCALES` | `en_US` | build |
 | `ECOMSCAN_SHA256` | empty | optional eComscan binary checksum |
 | `AWS_ROLE_ARN` | empty | AWS OIDC role; when empty, access keys are used (S3-compatible storage) |
-| `AWS_REGION`, `S3_BUCKET`, `S3_ENDPOINT` | | deploy (`S3_ENDPOINT` empty for AWS) |
+| `AWS_REGION`, `S3_BUCKET`, `S3_ENDPOINT` | | deploy (`S3_ENDPOINT` empty for AWS); secrets with the same names from the old pipeline still work |
 | `DEPLOY_ISSUE_ASSIGNEE` | empty | production deployment issue assignee |
 | `DEPLOY_WEBHOOK_TIMEOUT` | `960` | seconds to wait for synchronous webhook deploy |
 | `GRAPHQL_URL_STAGING`, `GRAPHQL_URL_PRODUCTION` | | post-deploy checks, e.g. `https://api.example.com/graphql` |
@@ -86,14 +98,14 @@ repository only) in secret `RELEASE_GITHUB_TOKEN` (used by `release.yml` only).
 | `STORE_CODE` | `default` | post-deploy `Store` header |
 | `REST_SMOKE_PATH` | empty | optional, e.g. `/rest/V1/directory/currency` |
 | `ZAP_SCAN_ENABLED` | empty | `true` enables ZAP API scan on staging |
-| `COPILOT_REVIEW_ENABLED` | empty | `true` enables Copilot review request |
+| `COPILOT_REVIEW_ENABLED` | empty | `false` disables Copilot review request (needs `COPILOT_TOKEN`) |
 
 ### Secrets
 
 | Secret | Used by |
 |---|---|
 | `COMPOSER_AUTH` | `{"http-basic":{"repo.magento.com":{"username":"<public>","password":"<private>"}}}` |
-| `CI_APP_PRIVATE_KEY` or `RELEASE_GITHUB_TOKEN` | see GitHub App |
+| `CI_APP_PRIVATE_KEY` or `MAGENX_CI_GITHUB_TOKEN` | see GitHub App |
 | `ECOMSCAN_KEY` | build security scan (skipped when empty) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only without `AWS_ROLE_ARN`; scope to `releases/*` of one bucket |
 | `DEPLOY_WEBHOOK_URL`, `SIGNATURE_HMAC_KEY` | deploy webhook |

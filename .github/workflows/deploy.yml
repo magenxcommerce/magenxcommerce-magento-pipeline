@@ -82,7 +82,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
 
       - name: Upload artifact to S3 storage
         id: artifact-upload-to-s3
@@ -90,9 +90,10 @@ jobs:
           USE_OIDC: ${{ vars.AWS_ROLE_ARN != '' }}
           S3_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           S3_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          S3_REGION: ${{ vars.AWS_REGION }}
-          S3_BUCKET: ${{ vars.S3_BUCKET }}
-          S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
+          # variables preferred; secrets kept for configs migrated from Magento-2-deployment-pipeline
+          S3_REGION: ${{ vars.AWS_REGION || secrets.AWS_REGION }}
+          S3_BUCKET: ${{ vars.S3_BUCKET || secrets.S3_BUCKET }}
+          S3_ENDPOINT: ${{ vars.S3_ENDPOINT || secrets.S3_ENDPOINT }}
           ASSET: ${{ steps.artifact-download.outputs.asset }}
         run: |
           if [ "${USE_OIDC}" != "true" ]; then

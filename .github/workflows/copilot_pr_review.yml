@@ -18,7 +18,7 @@ jobs:
   copilot_pr_review:
     name: Request Copilot code review
     if: >-
-      vars.COPILOT_REVIEW_ENABLED == 'true' &&
+      vars.COPILOT_REVIEW_ENABLED != 'false' &&
       !github.event.pull_request.draft &&
       !(startsWith(github.head_ref, 'release-please') && contains(github.event.pull_request.labels.*.name, 'autorelease: pending'))
     runs-on: ubuntu-latest
