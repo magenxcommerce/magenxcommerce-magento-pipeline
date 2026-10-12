@@ -1,0 +1,67 @@
+name: Composer outdated
+
+on:
+  schedule:
+    - cron: "0 5 * * 0"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  PHP_VERSION: ${{ vars.PHP_VERSION || '8.3' }}
+
+jobs:
+  composer-outdated:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP and Composer
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      # --locked reads composer.lock, no vendor install needed
+      - name: Check outdated direct packages
+        id: composer-outdated
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        run: |
+          composer outdated --locked --direct --no-dev --format=json --no-interaction > outdated.json
+          jq -r '(.locked // .installed // [])[] | select(.version != .latest) | "- `\(.name)` \(.version) → \(.latest)"' outdated.json > outdated.md
+          if [ -s outdated.md ]; then
+            echo "outdated=true" >> "${GITHUB_OUTPUT}"
+            cat outdated.md >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Create or replace outdated issue
+        if: ${{ steps.composer-outdated.outputs.outdated == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Composer outdated modules check"
+          date="$(date -u +%Y-%m-%d-%H:%M)"
+          gh issue list --repo "${GITHUB_REPOSITORY}" --label "composer: outdated" --state open \
+            --search "${title} in:title" --json number,title \
+            --jq ".[] | select(.title | startswith(\"${title}\")) | .number" \
+          | while read -r issue; do
+              gh issue close "${issue}" --repo "${GITHUB_REPOSITORY}" --reason "not planned" --comment "new check [${date}]"
+            done
+          {
+            echo "## ⚠️ Composer outdated modules:"
+            echo
+            cat outdated.md
+            echo
+            echo "generated on: [${date}] [workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+          } > body.md
+          gh label create "composer: outdated" --repo "${GITHUB_REPOSITORY}" --force > /dev/null
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "${title} [${date}]" \
+            --body-file body.md \
+            --label "composer: outdated"
