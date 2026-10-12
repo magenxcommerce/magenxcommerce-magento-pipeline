@@ -20,7 +20,7 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
                                    ▼
           pre-release tag vX.Y.Z-alpha.N ──► build.yml
                                               ├─ composer install --no-dev, di:compile, classmap
-                                              ├─ static deploy: adminhtml + Magento/blank (email CSS)
+                                              ├─ static deploy: adminhtml, plus email theme CSS only
                                               ├─ eComscan, tar.gz + sha256, build provenance attestation
                                               ├─ assets attached to the pre-release
                                               └─ deploy.yml (staging) ──► S3 + signed webhook
@@ -86,7 +86,8 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `PHP_VERSION` | `8.3` | all PHP jobs |
 | `PHP_EXTENSIONS` | Magento set | build |
 | `PRERELEASE_TYPE` | `alpha` | must match `prerelease-type` in `.github/release/prerelease-config.json` |
-| `STATIC_DEPLOY_ARGS` | `-f -n --no-ansi --area adminhtml --area frontend --theme Magento/backend --theme Magento/blank` | build |
+| `STATIC_DEPLOY_ARGS` | `-f -n --no-ansi --area adminhtml --theme Magento/backend` | build (admin static content) |
+| `STATIC_DEPLOY_EMAIL_THEME` | `Magento/blank` | build: frontend theme whose CSS transactional emails use; `none` skips it |
 | `STATIC_DEPLOY_LOCALES` | `en_US` | build |
 | `ECOMSCAN_SHA256` | empty | optional eComscan binary checksum |
 | `AWS_ROLE_ARN` | empty | AWS OIDC role; when empty, access keys are used (S3-compatible storage) |
@@ -158,9 +159,12 @@ The callback token needs only Contents: write on this repository (fine-grained P
 
 ## Headless notes
 
-- No storefront theme build. `Magento/blank` static files are still deployed because
-  transactional email CSS inlining reads them; remove it from `STATIC_DEPLOY_ARGS` only if Magento
-  does not send emails.
+- No storefront theme build. Only the admin area is deployed in full.
+- Transactional emails (order, invoice, password reset) are rendered by Magento with the store's frontend
+  theme: `{{css file="css/email.css"}}` and `email-inline.css` read the compiled theme CSS, and without it
+  emails go out unstyled in production mode. The build therefore deploys **CSS only** of
+  `STATIC_DEPLOY_EMAIL_THEME` (no JS, fonts, images, HTML). Set it to your email theme if you customized one,
+  or to `none` when emails come from an external service (Klaviyo, SendGrid, the headless frontend).
 - Keep `magento/theme-frontend-luma` and sample data out of the project (composer `replace`).
 - Do not `replace` the `*-graph-ql` modules the frontend uses.
 - PageSpeed checks belong to the frontend (PWA) repository; this pipeline tests the API.

@@ -46,8 +46,9 @@ jobs:
         uses: ./.github/actions/magento-build
         with:
           composer_autoload: "--no-dev --optimize --classmap-authoritative"
-          # admin area + Magento/blank (transactional email CSS), no storefront theme
-          static_content_deploy: ${{ vars.STATIC_DEPLOY_ARGS || '-f -n --no-ansi --area adminhtml --area frontend --theme Magento/backend --theme Magento/blank' }}
+          # no storefront theme: admin area, plus CSS of the email theme (STATIC_DEPLOY_EMAIL_THEME=none skips)
+          static_content_deploy: ${{ vars.STATIC_DEPLOY_ARGS || '-f -n --no-ansi --area adminhtml --theme Magento/backend' }}
+          static_content_email_theme: ${{ vars.STATIC_DEPLOY_EMAIL_THEME != 'none' && (vars.STATIC_DEPLOY_EMAIL_THEME || 'Magento/blank') || '' }}
           static_content_locales: ${{ vars.STATIC_DEPLOY_LOCALES || 'en_US' }}
 
       - name: Security scan
@@ -104,6 +105,7 @@ jobs:
           DI_COMPILE: ${{ steps.compile.outputs.setup_di_compile }}
           AUTOLOAD: ${{ steps.compile.outputs.composer_autoload }}
           STATIC_DEPLOY: ${{ steps.compile.outputs.static_content_deploy }}
+          EMAIL_STATIC_DEPLOY: ${{ steps.compile.outputs.email_static_deploy }}
           SANITY: ${{ steps.compile.outputs.sanity }}
           SCAN: ${{ steps.security-scan.outcome }}
           PACKAGE: ${{ steps.package.outcome }}
@@ -122,7 +124,8 @@ jobs:
             row "Composer install" "${COMPOSER_INSTALL}"
             row "Code compilation" "${DI_COMPILE}"
             row "Composer autoload" "${AUTOLOAD}"
-            row "Static content deploy (adminhtml, email)" "${STATIC_DEPLOY}"
+            row "Static content deploy (adminhtml)" "${STATIC_DEPLOY}"
+            row "Email theme CSS (frontend)" "${EMAIL_STATIC_DEPLOY}"
             row "bin/magento sanity" "${SANITY}"
             row "Security scan" "${SCAN}"
             row "Package artifact" "${PACKAGE}"
