@@ -1,9 +1,18 @@
 name: Post-deploy API checks
 
-# Deploy is asynchronous (webhook). The deploy server calls back when done:
+# Called after deploy.yml by build.yml / promote.yml (synchronous receiver such as magenx-deputy-go).
+# Asynchronous receivers call back instead:
 #   POST /repos/{owner}/{repo}/dispatches
 #   {"event_type":"deployment_completed","client_payload":{"environment":"staging","tag_name":"v1.2.0-alpha.1"}}
 on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      tag_name:
+        required: true
+        type: string
   repository_dispatch:
     types: [deployment_completed]
   workflow_dispatch:
@@ -24,7 +33,7 @@ concurrency:
 
 env:
   DEPLOY_ENV: ${{ inputs.environment || github.event.client_payload.environment }}
-  TAG_NAME: ${{ github.event.client_payload.tag_name }}
+  TAG_NAME: ${{ inputs.tag_name || github.event.client_payload.tag_name }}
 
 jobs:
   smoke:
@@ -54,11 +63,15 @@ jobs:
             production) url="${GRAPHQL_URL_PRODUCTION}" ;;
             *) echo "::error::Unknown environment ${DEPLOY_ENV}"; exit 1 ;;
           esac
-          [ -n "${url}" ] || { echo "::error::GRAPHQL_URL_${DEPLOY_ENV^^} variable not set"; exit 1; }
+          if [ -z "${url}" ]; then
+            echo "::warning::GRAPHQL_URL_${DEPLOY_ENV^^} variable not set, API checks skipped"
+            exit 0
+          fi
           echo "graphql_url=${url}" >> "${GITHUB_OUTPUT}"
 
       - name: GraphQL smoke query
         id: graphql
+        if: ${{ steps.target.outputs.graphql_url != '' }}
         env:
           GRAPHQL_URL: ${{ steps.target.outputs.graphql_url }}
           QUERY: ${{ vars.GRAPHQL_SMOKE_QUERY || '{ storeConfig { store_code base_currency_code } }' }}
@@ -76,7 +89,7 @@ jobs:
 
       - name: REST smoke request
         id: rest
-        if: ${{ vars.REST_SMOKE_PATH != '' }}
+        if: ${{ steps.target.outputs.graphql_url != '' && vars.REST_SMOKE_PATH != '' }}
         env:
           GRAPHQL_URL: ${{ steps.target.outputs.graphql_url }}
           REST_SMOKE_PATH: ${{ vars.REST_SMOKE_PATH }}

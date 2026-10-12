@@ -161,3 +161,16 @@ jobs:
       environment: staging
       tag_name: ${{ github.event.release.tag_name }}
     secrets: inherit
+
+  post-deploy:
+    name: Post-deploy API checks
+    needs: deploy-staging
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/post_deploy.yml
+    with:
+      environment: staging
+      tag_name: ${{ github.event.release.tag_name }}
+    secrets: inherit

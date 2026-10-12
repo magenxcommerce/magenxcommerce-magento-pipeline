@@ -31,7 +31,7 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
                                    ├─ download pre-release asset, verify sha256 + attestation
                                    ├─ attach the same bytes to the release (no rebuild)
                                    └─ deploy.yml (production, environment approval) ──► S3 + webhook
-          deploy server callback ──► post_deploy.yml: GraphQL/REST smoke test, ZAP API scan (staging)
+          after each deploy ──► post_deploy.yml: GraphQL/REST smoke test, ZAP API scan (staging)
 ```
 
 ## Workflows
@@ -47,7 +47,7 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
 | `build.yml` | pre-release published | build once, attest, attach artifact, deploy staging |
 | `promote.yml` | release published / manual | reuse verified pre-release artifact, deploy production |
 | `deploy.yml` | reusable / manual redeploy | verify artifact, upload to S3, signed webhook, status PR comment or issue |
-| `post_deploy.yml` | `repository_dispatch: deployment_completed` / manual | GraphQL + REST smoke test, ZAP GraphQL API scan |
+| `post_deploy.yml` | after deploy (reusable) / `repository_dispatch: deployment_completed` / manual | GraphQL + REST smoke test, ZAP GraphQL API scan |
 | `composer_outdated.yml` | weekly | issue with outdated direct packages |
 | `upgrade.yml` | manual | upgrade `magento/product-community-edition`, open PR |
 
@@ -80,6 +80,7 @@ repository only) in secret `RELEASE_GITHUB_TOKEN` (used by `release.yml` only).
 | `AWS_ROLE_ARN` | empty | AWS OIDC role; when empty, access keys are used (S3-compatible storage) |
 | `AWS_REGION`, `S3_BUCKET`, `S3_ENDPOINT` | | deploy (`S3_ENDPOINT` empty for AWS) |
 | `DEPLOY_ISSUE_ASSIGNEE` | empty | production deployment issue assignee |
+| `DEPLOY_WEBHOOK_TIMEOUT` | `960` | seconds to wait for synchronous webhook deploy |
 | `GRAPHQL_URL_STAGING`, `GRAPHQL_URL_PRODUCTION` | | post-deploy checks, e.g. `https://api.example.com/graphql` |
 | `GRAPHQL_SMOKE_QUERY` | `{ storeConfig { store_code base_currency_code } }` | post-deploy |
 | `STORE_CODE` | `default` | post-deploy `Store` header |
@@ -96,7 +97,7 @@ repository only) in secret `RELEASE_GITHUB_TOKEN` (used by `release.yml` only).
 | `ECOMSCAN_KEY` | build security scan (skipped when empty) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only without `AWS_ROLE_ARN`; scope to `releases/*` of one bucket |
 | `DEPLOY_WEBHOOK_URL`, `SIGNATURE_HMAC_KEY` | deploy webhook |
-| `DEPLOY_WEBHOOK_SECRET` | optional legacy header, HMAC signature is the real check |
+| `DEPLOY_WEBHOOK_SECRET` | `X-Webhook-Secret` header, required by magenx-deputy-go |
 | `COPILOT_TOKEN` | Copilot review request |
 
 Store deploy secrets as **environment secrets** on `staging` / `production` where possible.
@@ -111,12 +112,20 @@ Create `staging` and `production`. On `production` add required reviewers and re
 `POST DEPLOY_WEBHOOK_URL`, body (compact JSON, signed bytes):
 
 ```json
-{"environment":"staging","tag_name":"v1.2.0-alpha.1","artifact_name":"release_v1.2.0_abc1234.tar.gz","artifact_digest":"sha256:<hex>","timestamp":"1760000000"}
+{"environment":"staging","tag_name":"v1.2.0-alpha.1","artifact_name":"release_v1.2.0_abc1234.tar.gz","artifact_digest":"sha256:<hex>","timestamp":1760000000}
 ```
 
-Headers: `X-Signature: sha256=<HMAC-SHA256(body, SIGNATURE_HMAC_KEY)>`, `X-Timestamp`.
-The server must verify the signature, reject old timestamps, download
-`s3://$S3_BUCKET/releases/<artifact_name>`, check the sha256, deploy, then call back:
+Headers: `X-Webhook-Secret`, `X-Signature: sha256=<HMAC-SHA256(body, SIGNATURE_HMAC_KEY)>`, `X-Timestamp`
+(same value as body `timestamp`). Receiver: [magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go)
+(`webhook_secret` = `DEPLOY_WEBHOOK_SECRET`, `hmac_key` = `SIGNATURE_HMAC_KEY`, `brand`/`domain` from its config).
+The server must verify secret and signature, reject old timestamps, download
+`s3://$S3_BUCKET/releases/<artifact_name>`, check the sha256 and deploy.
+
+magenx-deputy-go answers after deploy and health check, so `deploy.yml` waits
+(`DEPLOY_WEBHOOK_TIMEOUT`, default 960 s, keep above deputy `deployment_timeout_seconds`) and
+`post_deploy.yml` runs right after. The webhook is never retried: a retry would deploy twice.
+
+An asynchronous receiver should instead answer immediately and call back when done:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \

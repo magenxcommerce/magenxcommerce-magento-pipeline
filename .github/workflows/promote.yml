@@ -80,3 +80,16 @@ jobs:
       environment: production
       tag_name: ${{ inputs.tag_name || github.event.release.tag_name }}
     secrets: inherit
+
+  post-deploy:
+    name: Post-deploy API checks
+    needs: deploy-production
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    uses: ./.github/workflows/post_deploy.yml
+    with:
+      environment: production
+      tag_name: ${{ inputs.tag_name || github.event.release.tag_name }}
+    secrets: inherit

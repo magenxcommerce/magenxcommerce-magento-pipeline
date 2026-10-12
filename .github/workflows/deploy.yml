@@ -113,6 +113,8 @@ jobs:
           DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
           DEPLOY_WEBHOOK_SECRET: ${{ secrets.DEPLOY_WEBHOOK_SECRET }}
           SIGNATURE_HMAC_KEY: ${{ secrets.SIGNATURE_HMAC_KEY }}
+          # keep above deputy deployment_timeout_seconds (default 900)
+          WEBHOOK_TIMEOUT: ${{ vars.DEPLOY_WEBHOOK_TIMEOUT || '960' }}
         run: |
           timestamp="$(date -u +%s)"
           jq -cn \
@@ -120,14 +122,16 @@ jobs:
             --arg tag_name "${TAG_NAME}" \
             --arg artifact_name "${ASSET}" \
             --arg artifact_digest "sha256:${SHA256}" \
-            --arg timestamp "${timestamp}" \
+            --argjson timestamp "${timestamp}" \
             '{environment: $environment, tag_name: $tag_name, artifact_name: $artifact_name, artifact_digest: $artifact_digest, timestamp: $timestamp}' \
             | tr -d '\n' > payload.json
           signature="$(openssl dgst -sha256 -hmac "${SIGNATURE_HMAC_KEY}" -r < payload.json | cut -d' ' -f1)"
           headers=(-H "Content-Type: application/json" -H "X-Signature: sha256=${signature}" -H "X-Timestamp: ${timestamp}")
-          # legacy shared-secret header, HMAC signature is the real check
+          # magenx-deputy-go requires both shared secret and HMAC signature
           [ -n "${DEPLOY_WEBHOOK_SECRET}" ] && headers+=(-H "X-Webhook-Secret: ${DEPLOY_WEBHOOK_SECRET}")
-          curl -sS --fail-with-body --retry 3 --retry-all-errors --max-time 30 \
+          # magenx-deputy-go deploys synchronously: response comes after deploy + health check.
+          # No retries: a retry would start a second deployment.
+          curl -sS --fail-with-body --max-time "${WEBHOOK_TIMEOUT}" \
             -X POST "${headers[@]}" --data-binary @payload.json "${DEPLOY_WEBHOOK_URL}"
 
       - name: Deployment status message
