@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
+      # wip: true sets a commit status on the PR head
+      statuses: write
     steps:
       # no checkout: pull_request_target must never run PR code
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
