@@ -1,0 +1,75 @@
+actions:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/workflows/**"
+          - ".github/actions/**"
+
+"release-please: config":
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".github/release/*.json"
+
+git:
+  - changed-files:
+      - any-glob-to-any-file:
+          - ".editorconfig"
+          - ".gitignore"
+
+composer:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "composer.json"
+          - "composer.lock"
+
+module:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "app/code/**"
+
+patches:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "patches/**"
+
+graphql:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/etc/schema.graphqls"
+          - "**/etc/graphql/**"
+          - "**/Model/Resolver/**"
+
+webapi:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/etc/webapi.xml"
+          - "**/etc/webapi_rest/**"
+          - "**/Api/**"
+
+"admin ui":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/view/adminhtml/**"
+          - "app/design/adminhtml/**"
+
+db schema:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/etc/db_schema.xml"
+          - "**/etc/db_schema_whitelist.json"
+          - "**/Setup/Patch/**"
+
+php:
+  - changed-files:
+      - any-glob-to-any-file: "**/*.php"
+
+xml:
+  - changed-files:
+      - any-glob-to-any-file: "**/*.xml"
+
+config.php:
+  - changed-files:
+      - any-glob-to-any-file: "app/etc/config.php"
+
+di.xml:
+  - changed-files:
+      - any-glob-to-any-file: "**/etc/di.xml"

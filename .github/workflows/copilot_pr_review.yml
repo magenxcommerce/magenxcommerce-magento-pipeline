@@ -1,0 +1,30 @@
+name: Copilot PR review
+
+# Alternative without a PAT: repository ruleset "Automatically request Copilot code review".
+on:
+  pull_request:
+    types:
+      - opened
+      - ready_for_review
+    paths:
+      - "**.php"
+      - "**.js"
+      - "**.xml"
+      - "**.graphqls"
+
+permissions: {}
+
+jobs:
+  copilot_pr_review:
+    name: Request Copilot code review
+    if: >-
+      vars.COPILOT_REVIEW_ENABLED == 'true' &&
+      !github.event.pull_request.draft &&
+      !(startsWith(github.head_ref, 'release-please') && contains(github.event.pull_request.labels.*.name, 'autorelease: pending'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request review from Copilot
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --add-reviewer @copilot

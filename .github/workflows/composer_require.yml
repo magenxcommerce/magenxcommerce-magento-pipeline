@@ -1,0 +1,137 @@
+name: Composer require and lock sync
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+    paths:
+      - "composer.json"
+      - "composer.lock"
+
+permissions: {}
+
+concurrency:
+  group: composer-require-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PHP_VERSION: ${{ vars.PHP_VERSION || '8.3' }}
+
+jobs:
+  composer-sync:
+    # same-repo PRs only: workflow pushes back to the PR branch
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !(startsWith(github.head_ref, 'release-please') && contains(github.event.pull_request.labels.*.name, 'autorelease: pending'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # App token: push-back commit re-triggers CI (GITHUB_TOKEN pushes do not)
+      - name: Create GitHub App token
+        id: app-token
+        if: ${{ vars.CI_APP_CLIENT_ID != '' }}
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+
+      - name: Checkout PR branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Setup PHP and Composer
+        uses: ./.github/actions/setup-php-composer
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+
+      - name: Composer require diff
+        id: composer-diff
+        uses: ./.github/actions/composer-diff
+        with:
+          base_ref: ${{ github.event.pull_request.base.ref }}
+          base_path: "base"
+
+      - name: Update lock for changed and removed packages
+        if: ${{ steps.composer-diff.outputs.magento_update != 'true' && (steps.composer-diff.outputs.changed == 'true' || steps.composer-diff.outputs.removed == 'true') }}
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        run: |
+          mapfile -t packages < <(cut -d' ' -f1 changed.txt; cat removed.txt)
+          composer update "${packages[@]}" --with-dependencies --no-install --no-scripts --no-interaction --no-progress
+
+      - name: Update all for Magento version change
+        if: ${{ steps.composer-diff.outputs.magento_update == 'true' }}
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        run: composer update -W --no-install --no-scripts --no-interaction --no-progress
+
+      - name: Composer install
+        env:
+          COMPOSER_AUTH: ${{ secrets.COMPOSER_AUTH }}
+        run: composer install --no-dev --no-ansi --no-interaction --no-progress
+
+      - name: Composer lock diff and Magento module extract
+        id: composer-lock-diff
+        uses: ./.github/actions/composer-lock-diff
+        with:
+          base_path: "base"
+
+      - name: Enable new Magento modules in config.php
+        if: ${{ steps.composer-lock-diff.outputs.magento_modules == 'true' }}
+        run: |
+          mapfile -t modules < magento_modules.txt
+          bin/magento module:enable "${modules[@]}" -n --no-ansi
+
+      - name: Commit composer.lock and config.php back to PR branch
+        id: commit
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add composer.lock
+          [ -f app/etc/config.php ] && git add app/etc/config.php
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "chore(composer): Sync composer.lock and app/etc/config.php"
+          git push origin "HEAD:${HEAD_REF}"
+          echo "pushed=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Build report
+        id: report
+        run: |
+          list() { [ -s "$1" ] && awk '{printf "- `%s`\n", $0}' "$1" || echo "- none"; }
+          {
+            echo "<!-- composer-report -->"
+            echo "## Composer changes"
+            echo "### composer.json added / changed"
+            list changed.txt
+            echo "### composer.json removed"
+            list removed.txt
+            echo "### New locked dependencies"
+            list locked.txt
+            echo "### New Magento modules enabled"
+            list magento_modules.txt
+            echo
+            echo "_[workflow run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})_"
+          } > report.md
+
+      - name: Create or update sticky PR comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          comment_id="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            --jq '.[] | select(.body | startswith("<!-- composer-report -->")) | .id' | tail -n 1)"
+          if [ -n "${comment_id}" ]; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${comment_id}" -F body=@report.md > /dev/null
+          else
+            gh pr comment "${PR_NUMBER}" --repo "${GITHUB_REPOSITORY}" --body-file report.md
+          fi
