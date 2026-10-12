@@ -6,8 +6,10 @@ on:
 
 permissions: {}
 
+# A newer pre-release supersedes an in-flight build, so staging never ends on an older build.
 concurrency:
-  group: build-${{ github.event.release.tag_name }}
+  group: build
+  cancel-in-progress: true
 
 env:
   PHP_VERSION: ${{ vars.PHP_VERSION || '8.3' }}
