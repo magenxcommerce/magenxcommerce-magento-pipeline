@@ -1,0 +1,54 @@
+name: "Composer lock diff and Magento module extract"
+author: "MagenX"
+description: "Find new dependencies in composer.lock and extract new Magento module names."
+
+inputs:
+  base_path:
+    description: "Checkout path of base branch"
+    required: true
+
+outputs:
+  locked:
+    description: "true if new locked dependencies found (locked.txt)"
+    value: ${{ steps.lock-diff.outputs.locked }}
+  magento_modules:
+    description: "true if new Magento modules found (magento_modules.txt)"
+    value: ${{ steps.modules.outputs.magento_modules }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Find new dependencies in composer.lock
+      id: lock-diff
+      shell: bash
+      env:
+        BASE_PATH: ${{ inputs.base_path }}
+      run: |
+        if [ -f "${BASE_PATH}/composer.lock" ]; then
+          composer show --working-dir="${BASE_PATH}" --locked -N | sort > locked_old.txt
+        else
+          : > locked_old.txt
+        fi
+        composer show --locked -N | sort > locked_new.txt
+        comm -13 locked_old.txt locked_new.txt > locked.txt
+        if [ -s locked.txt ]; then
+          echo "::notice::New locked dependencies: $(xargs < locked.txt)"
+          echo "locked=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+    - name: Extract Magento module names from new dependencies
+      id: modules
+      shell: bash
+      run: |
+        : > magento_modules.txt
+        while read -r package; do
+          registration="vendor/${package}/registration.php"
+          [ -f "${registration}" ] || continue
+          # shellcheck disable=SC2016 # PHP code, not shell
+          php -r 'preg_match("/ComponentRegistrar::MODULE,\s*[\x27\"]([^\x27\"]+)[\x27\"]/", file_get_contents($argv[1]), $m); echo $m[1] ?? "";' "${registration}" \
+            | grep . >> magento_modules.txt || true
+        done < locked.txt
+        if [ -s magento_modules.txt ]; then
+          echo "::notice::New Magento modules: $(xargs < magento_modules.txt)"
+          echo "magento_modules=true" >> "${GITHUB_OUTPUT}"
+        fi

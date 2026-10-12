@@ -1,0 +1,70 @@
+name: "Composer require diff"
+author: "MagenX"
+description: "Compare composer.json require block with base branch. Outputs changed, removed packages and Magento version change."
+
+inputs:
+  base_ref:
+    description: "Base branch ref to compare against"
+    required: true
+  base_path:
+    description: "Checkout path for base branch"
+    required: false
+    default: "base"
+
+outputs:
+  changed:
+    description: "true if packages were added or constraints changed (changed.txt)"
+    value: ${{ steps.diff.outputs.changed }}
+  removed:
+    description: "true if packages were removed (removed.txt)"
+    value: ${{ steps.diff.outputs.removed }}
+  magento_update:
+    description: "true if magento/product-community-edition constraint changed"
+    value: ${{ steps.diff.outputs.magento_update }}
+  magento_version:
+    description: "New magento/product-community-edition constraint"
+    value: ${{ steps.diff.outputs.magento_version }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate composer.json from PR
+      shell: bash
+      run: composer validate --no-check-all --no-check-lock --no-check-publish --no-check-version
+
+    - name: Checkout base branch
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        ref: ${{ inputs.base_ref }}
+        path: ${{ inputs.base_path }}
+        persist-credentials: false
+
+    - name: Diff require blocks
+      id: diff
+      shell: bash
+      env:
+        BASE_PATH: ${{ inputs.base_path }}
+      run: |
+        jq -r '(.require // {}) | to_entries[] | "\(.key) \(.value)"' "${BASE_PATH}/composer.json" | sort > require_old.txt
+        jq -r '(.require // {}) | to_entries[] | "\(.key) \(.value)"' composer.json | sort > require_new.txt
+
+        # added packages or changed constraints: "vendor/package constraint"
+        comm -13 require_old.txt require_new.txt > changed.txt
+        # removed packages: "vendor/package"
+        comm -23 <(cut -d' ' -f1 require_old.txt) <(cut -d' ' -f1 require_new.txt) > removed.txt
+
+        if [ -s changed.txt ]; then
+          echo "::notice::Composer packages added or changed: $(cut -d' ' -f1 changed.txt | xargs)"
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+        fi
+        if [ -s removed.txt ]; then
+          echo "::notice::Composer packages removed: $(xargs < removed.txt)"
+          echo "removed=true" >> "${GITHUB_OUTPUT}"
+        fi
+
+        magento_version="$(awk '$1 == "magento/product-community-edition" {print $2}' changed.txt)"
+        if [ -n "${magento_version}" ]; then
+          echo "::notice::Magento version change: ${magento_version}"
+          echo "magento_update=true" >> "${GITHUB_OUTPUT}"
+          echo "magento_version=${magento_version}" >> "${GITHUB_OUTPUT}"
+        fi

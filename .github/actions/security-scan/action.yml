@@ -1,0 +1,51 @@
+name: "Run security scan"
+author: "MagenX"
+description: "Download eComscan and scan the working directory for malware and known vulnerable code."
+
+inputs:
+  ecomscan_key:
+    description: "eComscan license key. Empty skips scan."
+    required: false
+    default: ""
+  ecomscan_sha256:
+    description: "Optional sha256 of the eComscan binary to verify download"
+    required: false
+    default: ""
+
+outputs:
+  report:
+    description: "Path to scan report"
+    value: ${{ steps.security-scan.outputs.report }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download eComscan
+      id: ecomscan
+      if: ${{ inputs.ecomscan_key != '' }}
+      shell: bash
+      env:
+        ECOMSCAN_SHA256: ${{ inputs.ecomscan_sha256 }}
+      run: |
+        curl -fsSL --retry 3 -o "${RUNNER_TEMP}/ecomscan" https://ecomscan.com/downloads/linux-amd64/ecomscan
+        if [ -n "${ECOMSCAN_SHA256}" ]; then
+          echo "${ECOMSCAN_SHA256}  ${RUNNER_TEMP}/ecomscan" | sha256sum -c -
+        fi
+        chmod +x "${RUNNER_TEMP}/ecomscan"
+
+    - name: Run eComscan
+      id: security-scan
+      if: ${{ inputs.ecomscan_key != '' }}
+      shell: bash
+      env:
+        ECOMSCAN_KEY: ${{ inputs.ecomscan_key }}
+      run: |
+        report="${RUNNER_TEMP}/security_scan.log"
+        echo "report=${report}" >> "${GITHUB_OUTPUT}"
+        "${RUNNER_TEMP}/ecomscan" --no-auto-update --skip-database --skip-dashboard \
+          --newonly --state-file "${RUNNER_TEMP}/ecomscan.state" . | tee "${report}"
+
+    - name: Scan skipped
+      if: ${{ inputs.ecomscan_key == '' }}
+      shell: bash
+      run: echo "::warning::ECOMSCAN_KEY not set, security scan skipped"

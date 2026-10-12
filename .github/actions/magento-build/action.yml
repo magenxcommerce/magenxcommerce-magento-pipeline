@@ -1,0 +1,88 @@
+name: "Magento 2 headless build"
+author: "MagenX"
+description: "Run setup:di:compile, optimize autoload and deploy admin static content. No storefront theme build."
+
+inputs:
+  setup_di_compile:
+    description: "Options for bin/magento setup:di:compile"
+    required: false
+    default: "-n --no-ansi"
+  composer_autoload:
+    description: "Options for composer dump-autoload. Empty skips step."
+    required: false
+    default: ""
+  static_content_deploy:
+    description: >-
+      Options for bin/magento setup:static-content:deploy. Empty skips step.
+      Jobs are set to the number of CPUs automatically.
+    required: false
+    default: ""
+  static_content_locales:
+    description: "Space separated locales for static content deploy"
+    required: false
+    default: "en_US"
+
+outputs:
+  setup_di_compile:
+    description: "Outcome of compilation step"
+    value: ${{ steps.status.outputs.setup_di_compile }}
+  composer_autoload:
+    description: "Outcome of composer autoload step"
+    value: ${{ steps.status.outputs.composer_autoload }}
+  static_content_deploy:
+    description: "Outcome of static content deploy step"
+    value: ${{ steps.status.outputs.static_content_deploy }}
+  sanity:
+    description: "Outcome of bin/magento sanity check"
+    value: ${{ steps.status.outputs.sanity }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Run setup:di:compile
+      id: setup-di-compile
+      shell: bash
+      env:
+        ARGS: ${{ inputs.setup_di_compile }}
+      run: |
+        # shellcheck disable=SC2086
+        bin/magento setup:di:compile ${ARGS}
+
+    - name: Composer classmap optimization
+      id: composer-autoload
+      if: ${{ inputs.composer_autoload != '' }}
+      shell: bash
+      env:
+        ARGS: ${{ inputs.composer_autoload }}
+      run: |
+        # shellcheck disable=SC2086
+        composer dump-autoload ${ARGS}
+
+    # Headless: admin area plus Magento/blank for transactional email CSS only.
+    - name: Deploy static content
+      id: static-content-deploy
+      if: ${{ inputs.static_content_deploy != '' }}
+      shell: bash
+      env:
+        ARGS: ${{ inputs.static_content_deploy }}
+        LOCALES: ${{ inputs.static_content_locales }}
+      run: |
+        # shellcheck disable=SC2086
+        bin/magento setup:static-content:deploy ${ARGS} --jobs "$(nproc)" ${LOCALES}
+
+    - name: Sanity check bin/magento
+      id: sanity
+      shell: bash
+      run: bin/magento --version
+
+    - name: Status output for steps
+      id: status
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: |
+        {
+          echo "setup_di_compile=${{ steps.setup-di-compile.outcome }}"
+          echo "composer_autoload=${{ steps.composer-autoload.outcome }}"
+          echo "static_content_deploy=${{ steps.static-content-deploy.outcome }}"
+          echo "sanity=${{ steps.sanity.outcome }}"
+        } >> "${GITHUB_OUTPUT}"

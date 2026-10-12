@@ -1,0 +1,70 @@
+name: "Setup PHP and Composer"
+author: "MagenX"
+description: "Set up PHP with Magento extensions, cache Composer downloads and optionally run composer install"
+
+inputs:
+  php-version:
+    description: "PHP version"
+    required: false
+    default: "8.3"
+  extensions:
+    description: "PHP extensions (setup-php format)"
+    required: false
+    default: "bcmath, ctype, curl, dom, fileinfo, gd, hash, iconv, intl, mbstring, openssl, pdo_mysql, simplexml, soap, sockets, sodium, spl, xmlwriter, xsl, zip"
+  tools:
+    description: "Extra tools for setup-php"
+    required: false
+    default: "composer:v2"
+  composer-auth:
+    description: "COMPOSER_AUTH json (repo.magento.com keys)"
+    required: false
+    default: ""
+  install-args:
+    description: "Run composer install with these options. Empty skips install."
+    required: false
+    default: ""
+
+outputs:
+  cache-hit:
+    description: "Composer cache hit"
+    value: ${{ steps.cache.outputs.cache-hit }}
+  composer-install:
+    description: "Outcome of composer install step"
+    value: ${{ steps.composer-install.outcome }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up PHP
+      uses: shivammathur/setup-php@7c071dfe9dc99bdf297fa79cb49ea005b9fcadbc # v2.37.1
+      with:
+        php-version: ${{ inputs.php-version }}
+        extensions: ${{ inputs.extensions }}
+        tools: ${{ inputs.tools }}
+        ini-values: memory_limit=-1
+        coverage: none
+
+    - name: Get Composer cache directory
+      id: composer-cache
+      shell: bash
+      run: echo "dir=$(composer config --global cache-files-dir)" >> "${GITHUB_OUTPUT}"
+
+    - name: Cache Composer packages
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.composer-cache.outputs.dir }}
+        key: ${{ runner.os }}-php${{ inputs.php-version }}-composer-${{ hashFiles('composer.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-php${{ inputs.php-version }}-composer-
+
+    - name: Composer install
+      id: composer-install
+      if: ${{ inputs.install-args != '' }}
+      shell: bash
+      env:
+        COMPOSER_AUTH: ${{ inputs.composer-auth }}
+        INSTALL_ARGS: ${{ inputs.install-args }}
+      run: |
+        # shellcheck disable=SC2086 # word splitting of options is intended
+        composer install ${INSTALL_ARGS}
