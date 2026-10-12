@@ -17,6 +17,12 @@ inputs:
       Jobs are set to the number of CPUs automatically.
     required: false
     default: ""
+  static_content_email_theme:
+    description: >-
+      Frontend theme used by transactional emails (e.g. Magento/blank). Only its CSS is deployed
+      (email.css, email-inline.css). Empty skips step.
+    required: false
+    default: ""
   static_content_locales:
     description: "Space separated locales for static content deploy"
     required: false
@@ -32,6 +38,9 @@ outputs:
   static_content_deploy:
     description: "Outcome of static content deploy step"
     value: ${{ steps.status.outputs.static_content_deploy }}
+  email_static_deploy:
+    description: "Outcome of email theme CSS deploy step"
+    value: ${{ steps.status.outputs.email_static_deploy }}
   sanity:
     description: "Outcome of bin/magento sanity check"
     value: ${{ steps.status.outputs.sanity }}
@@ -58,7 +67,7 @@ runs:
         # shellcheck disable=SC2086
         composer dump-autoload ${ARGS}
 
-    # Headless: admin area plus Magento/blank for transactional email CSS only.
+    # Headless: no storefront theme. Admin area only here; email CSS below.
     - name: Deploy static content
       id: static-content-deploy
       if: ${{ inputs.static_content_deploy != '' }}
@@ -69,6 +78,23 @@ runs:
       run: |
         # shellcheck disable=SC2086
         bin/magento setup:static-content:deploy ${ARGS} --jobs "$(nproc)" ${LOCALES}
+
+    # Magento renders transactional emails with the store's frontend theme: {{css file="css/email.css"}}
+    # and email-inline.css read compiled theme CSS. Without it emails go out unstyled in production mode.
+    # CSS/LESS only; JS, fonts, images and HTML templates are never used by emails.
+    - name: Deploy email theme CSS
+      id: email-static-deploy
+      if: ${{ inputs.static_content_email_theme != '' }}
+      shell: bash
+      env:
+        THEME: ${{ inputs.static_content_email_theme }}
+        LOCALES: ${{ inputs.static_content_locales }}
+      run: |
+        # shellcheck disable=SC2086
+        bin/magento setup:static-content:deploy -f -n --no-ansi \
+          --area frontend --theme "${THEME}" \
+          --no-javascript --no-js-bundle --no-fonts --no-images --no-html --no-html-minify \
+          --jobs "$(nproc)" ${LOCALES}
 
     - name: Sanity check bin/magento
       id: sanity
@@ -84,5 +110,6 @@ runs:
           echo "setup_di_compile=${{ steps.setup-di-compile.outcome }}"
           echo "composer_autoload=${{ steps.composer-autoload.outcome }}"
           echo "static_content_deploy=${{ steps.static-content-deploy.outcome }}"
+          echo "email_static_deploy=${{ steps.email-static-deploy.outcome }}"
           echo "sanity=${{ steps.sanity.outcome }}"
         } >> "${GITHUB_OUTPUT}"
