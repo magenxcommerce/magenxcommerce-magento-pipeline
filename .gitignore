@@ -1,0 +1,21 @@
+# Magento project: commit composer.json, composer.lock, app/etc/config.php, app/code, patches.
+# If magento2-base files (bin, dev, lib, pub/*.php, setup, app/etc/di.xml) are not committed, ignore them here too.
+
+/vendor/
+/generated/
+/var/
+/pub/static/
+/pub/media/
+/app/etc/env.php
+/auth.json
+/node_modules/
+
+# IDE / OS
+/.idea/
+/.vscode/
+.DS_Store
+
+# tool caches
+/.php-cs-fixer.cache
+/.phpunit.cache/
+/.phpunit.result.cache
