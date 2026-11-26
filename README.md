@@ -23,14 +23,14 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
                                               ├─ static deploy: adminhtml, plus email theme CSS only
                                               ├─ eComscan, tar.gz + sha256, build provenance attestation
                                               ├─ assets attached to the pre-release
-                                              └─ deploy.yml (staging) ──► S3 + signed webhook
+                                              └─ deploy.yml (staging) ──► OCI image and/or S3 + signed webhook
           release.yml opens release PR (status comments: build, deploy, smoke)
                                    │ test staging; merge release PR
                                    ▼
           release tag vX.Y.Z ──► promote.yml
                                    ├─ download pre-release asset, verify sha256 + attestation
                                    ├─ attach the same bytes to the release (no rebuild)
-                                   └─ deploy.yml (production, environment approval) ──► S3 + webhook
+                                   └─ deploy.yml (production, environment approval) ──► OCI image and/or S3 + webhook
           after each deploy ──► post_deploy.yml: GraphQL/REST smoke test, ZAP API scan (staging)
 ```
 
@@ -58,13 +58,13 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
 | `release.yml` | push to main | release-please pre-release PR/tag, then release PR |
 | `build.yml` | pre-release published | build once, attest, attach artifact, deploy staging |
 | `promote.yml` | release published / manual | reuse verified pre-release artifact, deploy production |
-| `deploy.yml` | reusable / manual redeploy | verify artifact, upload to S3, signed webhook, status PR comment or issue |
+| `deploy.yml` | reusable / manual redeploy | verify artifact, push signed image to `OCI_REPOSITORY` and/or upload to S3, signed webhook, move the environment tag, status PR comment or issue |
 | `post_deploy.yml` | after deploy (reusable) / `repository_dispatch: deployment_completed` / manual | GraphQL + REST smoke test, ZAP GraphQL API scan |
 | `composer_outdated.yml` | weekly | issue with outdated direct packages |
 | `upgrade.yml` | manual | upgrade `magento/product-community-edition`, open PR |
 
 Composite actions in `.github/actions/`: `setup-php-composer`, `magento-build`, `composer-diff`,
-`composer-lock-diff`, `security-scan`, `release-pr-comment`.
+`composer-lock-diff`, `security-scan`, `release-pr-comment`, `oci-release`.
 
 ## Setup
 
@@ -91,7 +91,8 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `STATIC_DEPLOY_LOCALES` | `en_US` | build |
 | `ECOMSCAN_SHA256` | empty | optional eComscan binary checksum |
 | `AWS_ROLE_ARN` | empty | AWS OIDC role; when empty, access keys are used (S3-compatible storage) |
-| `AWS_REGION`, `S3_BUCKET`, `S3_ENDPOINT` | | deploy (`S3_ENDPOINT` empty for AWS); secrets with the same names from the old pipeline still work |
+| `AWS_REGION`, `S3_BUCKET`, `S3_ENDPOINT` | | deploy (`S3_ENDPOINT` empty for AWS); secrets with the same names from the old pipeline still work. Empty `S3_BUCKET` skips S3 when `OCI_REPOSITORY` is set |
+| `OCI_REPOSITORY` | empty | deploy: push the release to this image repository, e.g. `ghcr.io/acme/magento-release` (see [OCI registry](#oci-registry)) |
 | `DEPLOY_ISSUE_ASSIGNEE` | empty | production deployment issue assignee |
 | `DEPLOY_WEBHOOK_TIMEOUT` | `960` | seconds to wait for synchronous webhook deploy |
 | `GRAPHQL_URL_STAGING`, `GRAPHQL_URL_PRODUCTION` | | post-deploy checks, e.g. `https://api.example.com/graphql` |
@@ -111,6 +112,7 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only without `AWS_ROLE_ARN`; scope to `releases/*` of one bucket |
 | `DEPLOY_WEBHOOK_URL`, `SIGNATURE_HMAC_KEY` | deploy webhook |
 | `DEPLOY_WEBHOOK_SECRET` | `X-Webhook-Secret` header, required by magenx-deputy-go |
+| `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` | with `OCI_REPOSITORY`: signs the release image (`cosign generate-key-pair`) |
 | `COPILOT_TOKEN` | Copilot review request |
 
 Store deploy secrets as **environment secrets** on `staging` / `production` where possible.
@@ -128,11 +130,18 @@ Create `staging` and `production`. On `production` add required reviewers and re
 {"environment":"staging","tag_name":"v1.2.0-alpha.1","artifact_name":"release_v1.2.0_abc1234.tar.gz","artifact_digest":"sha256:<hex>","timestamp":1760000000}
 ```
 
+With `OCI_REPOSITORY` set, `tag` replaces `artifact_name` (magenx-deputy-go `deploy.source: oci` names the
+release dir after it):
+
+```json
+{"environment":"staging","tag_name":"v1.2.0-alpha.1","artifact_digest":"sha256:<hex>","timestamp":1760000000,"tag":"v1.2.0-alpha.1"}
+```
+
 Headers: `X-Webhook-Secret`, `X-Signature: sha256=<HMAC-SHA256(body, SIGNATURE_HMAC_KEY)>`, `X-Timestamp`
 (same value as body `timestamp`). Receiver: [magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go)
 (`webhook_secret` = `DEPLOY_WEBHOOK_SECRET`, `hmac_key` = `SIGNATURE_HMAC_KEY`, `brand`/`domain` from its config).
 The server must verify secret and signature, reject old timestamps, download
-`s3://$S3_BUCKET/releases/<artifact_name>`, check the sha256 and deploy.
+`s3://$S3_BUCKET/releases/<artifact_name>` (or `<OCI_REPOSITORY>:<tag>`), check the sha256 and deploy.
 
 magenx-deputy-go answers after deploy and health check, so `deploy.yml` waits
 (`DEPLOY_WEBHOOK_TIMEOUT`, default 960 s, keep above deputy `deployment_timeout_seconds`) and
@@ -147,6 +156,35 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.githu
 ```
 
 The callback token needs only Contents: write on this repository (fine-grained PAT or App).
+
+### OCI registry
+
+With variable `OCI_REPOSITORY`, `deploy.yml` (`.github/actions/oci-release`) pushes the verified release archive
+as an image whose only layer is the archive itself (`crane append`), so the layer digest is the archive's sha256,
+the webhook `artifact_digest`:
+
+1. `<OCI_REPOSITORY>:<tag>`, annotated `org.opencontainers.image.version=<tag>`: the pre-release tag for
+   staging, the release tag for production. Both manifests hold the same layer, so promotion uploads no bytes
+2. signed with `COSIGN_PRIVATE_KEY`, without transparency log (a private release is not published to the
+   public Rekor log); a tag that already holds the archive and a signature that verifies are kept on a redeploy
+3. after a successful webhook deploy, the moving tag `staging` or `production` points to it: new servers
+   deploy it with `magenx-deputy-go bootstrap -tag production`
+
+Server side ([magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go), OCI registry source):
+
+```yaml
+oci:
+  username: <github user>                # read:packages PAT in REGISTRY_PASSWORD (/etc/magenx-deputy-go/env)
+deploy:
+  source: oci
+  oci_repository: ghcr.io/acme/magento-release
+  cosign_public_key: /etc/magenx-deputy-go/release-cosign.pub   # public half of COSIGN_PRIVATE_KEY
+```
+
+The job logs in with `GITHUB_TOKEN` (`packages: write`). A package created by this workflow is linked to
+the repository; for an existing package, give this repository write access in the package settings
+(Manage Actions access). With `OCI_REPOSITORY` and `S3_BUCKET` both set the release goes to both, the payload
+uses `tag`; without `S3_BUCKET` S3 is skipped.
 
 ### Repository settings (SOC 2)
 

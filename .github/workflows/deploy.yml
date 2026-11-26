@@ -45,6 +45,8 @@ jobs:
       attestations: read
       issues: write
       pull-requests: write
+      # push and tag the release in the OCI registry (vars.OCI_REPOSITORY)
+      packages: write
     # configure required reviewers on the production environment
     environment:
       name: ${{ inputs.environment }}
@@ -75,6 +77,22 @@ jobs:
           echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
           echo "sha256=$(cut -d' ' -f1 "${asset}.sha256")" >> "${GITHUB_OUTPUT}"
 
+      # magenx-deputy-go deploy.source oci: the archive as the only layer of <OCI_REPOSITORY>:<tag>, signed.
+      # The same bytes in every environment: staging pushes the pre-release tag, production the release tag.
+      - name: Push release to OCI registry
+        id: oci-push
+        if: ${{ vars.OCI_REPOSITORY != '' }}
+        uses: ./.github/actions/oci-release
+        with:
+          repository: ${{ vars.OCI_REPOSITORY }}
+          tag: ${{ inputs.tag_name }}
+          archive: dist/${{ steps.artifact-download.outputs.asset }}
+          sha256: ${{ steps.artifact-download.outputs.sha256 }}
+          registry-username: ${{ github.actor }}
+          registry-password: ${{ github.token }}
+          cosign-private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          cosign-password: ${{ secrets.COSIGN_PASSWORD }}
+
       # AWS: OIDC role, no stored keys. S3-compatible (Hetzner, MinIO): scoped keys,
       # exported only inside the upload step.
       - name: Configure AWS credentials (OIDC)
@@ -95,7 +113,14 @@ jobs:
           S3_BUCKET: ${{ vars.S3_BUCKET || secrets.S3_BUCKET }}
           S3_ENDPOINT: ${{ vars.S3_ENDPOINT || secrets.S3_ENDPOINT }}
           ASSET: ${{ steps.artifact-download.outputs.asset }}
+          OCI_REPOSITORY: ${{ vars.OCI_REPOSITORY }}
         run: |
+          # S3 is optional next to the OCI registry
+          if [ -z "${S3_BUCKET}" ]; then
+            [ -n "${OCI_REPOSITORY}" ] || { echo "::error::set variable S3_BUCKET or OCI_REPOSITORY: no storage for the release"; exit 1; }
+            echo "S3_BUCKET is not set: release only in ${OCI_REPOSITORY}"
+            exit 0
+          fi
           if [ "${USE_OIDC}" != "true" ]; then
             export AWS_ACCESS_KEY_ID="${S3_ACCESS_KEY_ID}" AWS_SECRET_ACCESS_KEY="${S3_SECRET_ACCESS_KEY}" AWS_REGION="${S3_REGION}"
           fi
@@ -116,15 +141,20 @@ jobs:
           SIGNATURE_HMAC_KEY: ${{ secrets.SIGNATURE_HMAC_KEY }}
           # keep above deputy deployment_timeout_seconds (default 900)
           WEBHOOK_TIMEOUT: ${{ vars.DEPLOY_WEBHOOK_TIMEOUT || '960' }}
+          OCI_REPOSITORY: ${{ vars.OCI_REPOSITORY }}
         run: |
           timestamp="$(date -u +%s)"
+          # deploy.source oci: tag instead of artifact_name, deputy names the release dir after the tag
+          # and pulls <oci_repository>:<tag>; deploy.source s3: artifact_name in the bucket
           jq -cn \
             --arg environment "${DEPLOY_ENV}" \
             --arg tag_name "${TAG_NAME}" \
             --arg artifact_name "${ASSET}" \
             --arg artifact_digest "sha256:${SHA256}" \
             --argjson timestamp "${timestamp}" \
-            '{environment: $environment, tag_name: $tag_name, artifact_name: $artifact_name, artifact_digest: $artifact_digest, timestamp: $timestamp}' \
+            --arg oci "${OCI_REPOSITORY}" \
+            '{environment: $environment, tag_name: $tag_name, artifact_digest: $artifact_digest, timestamp: $timestamp}
+              + (if $oci != "" then {tag: $tag_name} else {artifact_name: $artifact_name} end)' \
             | tr -d '\n' > payload.json
           signature="$(openssl dgst -sha256 -hmac "${SIGNATURE_HMAC_KEY}" -r < payload.json | cut -d' ' -f1)"
           headers=(-H "Content-Type: application/json" -H "X-Signature: sha256=${signature}" -H "X-Timestamp: ${timestamp}")
@@ -135,25 +165,42 @@ jobs:
           curl -sS --fail-with-body --max-time "${WEBHOOK_TIMEOUT}" \
             -X POST "${headers[@]}" --data-binary @payload.json "${DEPLOY_WEBHOOK_URL}"
 
+      # the moving tag new servers bootstrap from: magenx-deputy-go bootstrap -tag <environment>
+      - name: Move environment tag
+        id: oci-tag
+        if: ${{ vars.OCI_REPOSITORY != '' }}
+        env:
+          OCI_REPOSITORY: ${{ vars.OCI_REPOSITORY }}
+        run: crane tag "${OCI_REPOSITORY}:${TAG_NAME}" "${DEPLOY_ENV}"
+
       - name: Deployment status message
         id: deployment-status-comment
         if: ${{ !cancelled() }}
         env:
           JOB_STATUS: ${{ job.status }}
           DOWNLOAD: ${{ steps.artifact-download.outcome }}
+          OCI_PUSH: ${{ steps.oci-push.outcome }}
           UPLOAD: ${{ steps.artifact-upload-to-s3.outcome }}
           WEBHOOK: ${{ steps.deployment-webhook.outcome }}
+          OCI_TAG: ${{ steps.oci-tag.outcome }}
           ASSET: ${{ steps.artifact-download.outputs.asset }}
+          OCI_REPOSITORY: ${{ vars.OCI_REPOSITORY }}
+          MANIFEST: ${{ steps.oci-push.outputs.manifest-digest }}
         run: |
           declare -A step_icons=( ["success"]="✔️" ["failure"]="❌" ["skipped"]="➖" ["cancelled"]="✖️" [""]="➖" )
           row() { echo "${step_icons[$2]} $1: ${2:-skipped}"; }
           {
             echo "## ⚠️ ${DEPLOY_ENV} release ${TAG_NAME} deployment status: ${JOB_STATUS}"
             row "Download and verify artifact (sha256, attestation)" "${DOWNLOAD}"
+            row "Push and sign release in OCI registry" "${OCI_PUSH}"
             row "Upload artifact to S3 storage" "${UPLOAD}"
             row "Deployment event webhook trigger" "${WEBHOOK}"
+            row "Move ${DEPLOY_ENV} tag" "${OCI_TAG}"
             echo
             echo "- **ARTIFACT**: \`${ASSET}\`"
+            if [ -n "${MANIFEST}" ]; then
+              echo "- **IMAGE**: \`${OCI_REPOSITORY}:${TAG_NAME}\` (\`${MANIFEST}\`)"
+            fi
             echo "- **RUN**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "- **DATE**: $(date -u +%Y-%m-%d-%H:%M) UTC"
           } > "${RUNNER_TEMP}/deployment.md"
