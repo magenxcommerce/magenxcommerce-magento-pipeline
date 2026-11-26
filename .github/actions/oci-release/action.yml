@@ -1,0 +1,89 @@
+name: "Push release to OCI registry"
+author: "MagenX"
+description: >-
+  Push the release archive as the only layer of <repository>:<tag>, annotated with the tag and signed with
+  cosign, as magenx-deputy-go reads it with deploy.source oci. Leaves crane on PATH and the registry logged in.
+
+inputs:
+  repository:
+    description: "Image repository without tag, e.g. ghcr.io/acme/magento-release"
+    required: true
+  tag:
+    description: "Release tag, also the org.opencontainers.image.version annotation"
+    required: true
+  archive:
+    description: "Path to the release archive (tar.gz)"
+    required: true
+  sha256:
+    description: "sha256 (hex) of the archive, checked before the push"
+    required: true
+  registry-username:
+    description: "Registry login user"
+    required: true
+  registry-password:
+    description: "Registry login password or token (ghcr.io: GITHUB_TOKEN with packages: write)"
+    required: true
+  cosign-private-key:
+    description: "cosign private key (cosign generate-key-pair)"
+    required: true
+  cosign-password:
+    description: "Password of the cosign private key"
+    required: false
+    default: ""
+
+outputs:
+  manifest-digest:
+    description: "Digest of the signed manifest"
+    value: ${{ steps.push.outputs.manifest-digest }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install crane and cosign
+      shell: bash
+      run: |
+        # versions and sha256 sums pinned here, update them together
+        CRANE_VERSION=0.22.1
+        CRANE_SHA256_X64=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
+        CRANE_SHA256_ARM64=898c0cff975f898a33e8c4580bdafb0e7c02c7faa33374e946762f97c4ab7110
+        COSIGN_VERSION=3.1.4
+        COSIGN_SHA256_X64=424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+        COSIGN_SHA256_ARM64=ade83b7aac62e131cacfe96d958948b2150cc9efec46a570a2649b8e27dedad2
+        case "${RUNNER_ARCH}" in
+          X64) crane_arch=x86_64; cosign_arch=amd64; crane_sha="${CRANE_SHA256_X64}"; cosign_sha="${COSIGN_SHA256_X64}" ;;
+          ARM64) crane_arch=arm64; cosign_arch=arm64; crane_sha="${CRANE_SHA256_ARM64}"; cosign_sha="${COSIGN_SHA256_ARM64}" ;;
+          *) echo "::error::unsupported runner architecture ${RUNNER_ARCH}"; exit 1 ;;
+        esac
+        bin="${RUNNER_TEMP}/oci-bin"
+        mkdir -p "${bin}"
+        curl -fsSL --retry 3 -o "${RUNNER_TEMP}/crane.tar.gz" \
+          "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${crane_arch}.tar.gz"
+        echo "${crane_sha}  ${RUNNER_TEMP}/crane.tar.gz" | sha256sum -c --quiet -
+        tar -xzf "${RUNNER_TEMP}/crane.tar.gz" -C "${bin}" crane
+        curl -fsSL --retry 3 -o "${bin}/cosign" \
+          "https://github.com/sigstore/cosign/releases/download/v${COSIGN_VERSION}/cosign-linux-${cosign_arch}"
+        echo "${cosign_sha}  ${bin}/cosign" | sha256sum -c --quiet -
+        chmod +x "${bin}/cosign"
+        echo "${bin}" >> "${GITHUB_PATH}"
+
+    - name: Registry login
+      shell: bash
+      env:
+        REPOSITORY: ${{ inputs.repository }}
+        REGISTRY_USERNAME: ${{ inputs.registry-username }}
+        REGISTRY_PASSWORD: ${{ inputs.registry-password }}
+      run: |
+        # ~/.docker/config.json, read by crane and cosign
+        crane auth login "${REPOSITORY%%/*}" -u "${REGISTRY_USERNAME}" --password-stdin <<< "${REGISTRY_PASSWORD}"
+
+    - name: Push, annotate and sign
+      id: push
+      shell: bash
+      env:
+        OCI_REPOSITORY: ${{ inputs.repository }}
+        TAG_NAME: ${{ inputs.tag }}
+        ARCHIVE: ${{ inputs.archive }}
+        SHA256: ${{ inputs.sha256 }}
+        COSIGN_PRIVATE_KEY: ${{ inputs.cosign-private-key }}
+        COSIGN_PASSWORD: ${{ inputs.cosign-password }}
+      run: bash "${GITHUB_ACTION_PATH}/oci-release.sh"

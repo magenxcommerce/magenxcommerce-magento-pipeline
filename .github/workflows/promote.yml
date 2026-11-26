@@ -75,6 +75,7 @@ jobs:
       attestations: read
       issues: write
       pull-requests: write
+      packages: write
     uses: ./.github/workflows/deploy.yml
     with:
       environment: production
