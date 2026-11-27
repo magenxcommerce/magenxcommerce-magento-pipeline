@@ -1,7 +1,7 @@
 name: Post-deploy API checks
 
-# Called after deploy.yml by build.yml / promote.yml (synchronous receiver such as magenx-deputy-go).
-# Asynchronous receivers call back instead:
+# Called after deploy.yml by build.yml / promote.yml; with variable DEPUTY_URLS deploy.yml has waited until
+# deputy deployed the release. Anything else that knows when a deploy finished can start the checks:
 #   POST /repos/{owner}/{repo}/dispatches
 #   {"event_type":"deployment_completed","client_payload":{"environment":"staging","tag_name":"v1.2.0-alpha.1"}}
 on:

@@ -12,6 +12,8 @@ env:
 
 jobs:
   composer-outdated:
+    # The template repository has no composer.json; copies have another name and run.
+    if: github.repository != 'magenxcommerce/magenxcommerce-magento-pipeline'
     runs-on: ubuntu-latest
     permissions:
       contents: read

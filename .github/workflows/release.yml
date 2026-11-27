@@ -21,6 +21,8 @@ concurrency:
 jobs:
   pre-release:
     name: Pre-release PR and tag
+    # The template repository has no Magento project and no release token; copies have another name and run.
+    if: github.repository != 'magenxcommerce/magenxcommerce-magento-pipeline'
     runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.pre-release.outputs.releases_created }}
