@@ -2,7 +2,7 @@
 
 SOC 2 friendly GitHub Actions pipeline for **headless** Magento 2 / Adobe Commerce projects:
 PR checks, composer automation, release-please pre-release/release, build once, promote the same
-artifact from staging to production, signed event-based deployment and post-deploy API checks.
+artifact from staging to production, deployment through a signed OCI image and a moving environment tag, and post-deploy API checks.
 
 Successor of [magenx/Magento-2-deployment-pipeline](https://github.com/magenx/Magento-2-deployment-pipeline),
 stripped of storefront tooling (Luma, Hyva, PageSpeed) and hardened.
@@ -25,14 +25,15 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
                                               ├─ static deploy: adminhtml, plus email theme CSS only
                                               ├─ eComscan, tar.gz + sha256, build provenance attestation
                                               ├─ assets attached to the pre-release
-                                              └─ deploy.yml (staging) ──► signed OCI image, staging tag (+ webhook)
+                                              └─ deploy.yml (staging) ──► signed OCI image, staging tag
           release.yml opens release PR (status comments: build, deploy, smoke)
                                    │ test staging; merge release PR
                                    ▼
           release tag vX.Y.Z ──► promote.yml
                                    ├─ download pre-release asset, verify sha256 + attestation
                                    ├─ attach the same bytes to the release (no rebuild)
-                                   └─ deploy.yml (production, environment approval) ──► signed OCI image, production tag (+ webhook)
+                                   └─ deploy.yml (production, environment approval) ──► signed OCI image, production tag
+          servers: magenx-deputy-go watch follows the staging / production tag and deploys
           after each deploy ──► post_deploy.yml: GraphQL/REST smoke test, ZAP API scan (staging)
 ```
 
@@ -60,7 +61,7 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
 | `release.yml` | push to main | release-please pre-release PR/tag, then release PR |
 | `build.yml` | pre-release published | build once, attest, attach artifact, deploy staging |
 | `promote.yml` | release published / manual | reuse verified pre-release artifact, deploy production |
-| `deploy.yml` | reusable / manual redeploy | verify artifact, push signed image to `OCI_REPOSITORY`, signed webhook (optional), move the environment tag, wait for deputy watch (optional), status PR comment or issue |
+| `deploy.yml` | reusable / manual redeploy | verify artifact, push signed image to `OCI_REPOSITORY`, move the environment tag, wait for deputy (optional), status PR comment or issue |
 | `post_deploy.yml` | after deploy (reusable) / `repository_dispatch: deployment_completed` / manual | GraphQL + REST smoke test, ZAP GraphQL API scan |
 | `composer_outdated.yml` | weekly | issue with outdated direct packages |
 | `upgrade.yml` | manual | upgrade `magento/product-community-edition`, open PR |
@@ -94,8 +95,8 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `ECOMSCAN_SHA256` | empty | optional eComscan binary checksum |
 | `OCI_REPOSITORY` | required | deploy: the image repository of the releases, e.g. `ghcr.io/acme/magento-release` (see [OCI registry](#oci-registry)) |
 | `DEPLOY_ISSUE_ASSIGNEE` | empty | production deployment issue assignee |
-| `DEPLOY_WEBHOOK_TIMEOUT` | `960` | seconds to wait for the webhook deploy, or for every server of `DEPUTY_URLS` |
-| `DEPUTY_URLS` | empty | watch only: base URLs of the servers' deputy (`http://10.1.0.4:8082`, space or comma separated), see [Deploy with deputy watch](#deploy-with-deputy-watch) |
+| `DEPUTY_WAIT_TIMEOUT` | `960` | seconds to wait for every server of `DEPUTY_URLS`; keep above deputy `deployment_timeout_seconds` |
+| `DEPUTY_URLS` | empty | base URLs of the servers' deputy (`http://10.1.0.4:8082`, space or comma separated), see [Deploy](#deploy) |
 | `GRAPHQL_URL_STAGING`, `GRAPHQL_URL_PRODUCTION` | | post-deploy checks, e.g. `https://api.example.com/graphql` |
 | `GRAPHQL_SMOKE_QUERY` | `{ storeConfig { store_code base_currency_code } }` | post-deploy |
 | `STORE_CODE` | `default` | post-deploy `Store` header |
@@ -110,71 +111,35 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `COMPOSER_AUTH` | `{"http-basic":{"repo.magento.com":{"username":"<public>","password":"<private>"}}}` |
 | `CI_APP_PRIVATE_KEY` or `MAGENX_CI_GITHUB_TOKEN` | see GitHub App |
 | `ECOMSCAN_KEY` | build security scan (skipped when empty) |
-| `DEPLOY_WEBHOOK_URL`, `SIGNATURE_HMAC_KEY` | deploy webhook; without `DEPLOY_WEBHOOK_URL` the environment tag is the deploy (deputy watch) |
-| `DEPLOY_WEBHOOK_SECRET` | `X-Webhook-Secret` header, required by the magenx-deputy-go webhook |
 | `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` | sign the release image: the same key pair as the docker configuration repository, whose public key is its committed `cosign/cosign.pub` (see [OCI registry](#oci-registry)) |
 | `COPILOT_TOKEN` | Copilot review request |
 
-Store deploy secrets as **environment secrets** on `staging` / `production` where possible.
+Store `COSIGN_*` as **environment secrets** or organization secrets on `staging` / `production` where possible.
 
 ### Environments
 
 Create `staging` and `production`. On `production` add required reviewers and restrict to tags
 `v*`; this gives an explicit, audited approval before production deploy.
 
-### Deploy with deputy watch
+### Deploy
 
-Without the secret `DEPLOY_WEBHOOK_URL` (on the environment), moving the environment tag is the deploy:
-[magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go) with `watch.enabled` follows
-`<OCI_REPOSITORY>:staging` or `:production` and deploys a new release on its own, from a `HEAD` of the tag every
-`watch.interval_seconds`. No webhook secrets, no inbound connection from GitHub runners, no server list: a new
-server follows the tag from its first start. The production approval still gates it: the tag only moves in the
+Moving the environment tag is the deploy: [magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go)
+with `watch.enabled` follows `<OCI_REPOSITORY>:staging` or `:production`, from a `HEAD` of the tag every
+`watch.interval_seconds`, checks the image signature and deploys the release the tag points to. No deploy
+secrets, no inbound connection from GitHub runners, no server list: a new server bootstraps from the same tag
+and follows it from its first start. The production approval still gates it: the tag only moves in the
 approved job.
 
 With variable `DEPUTY_URLS` (base URLs the runners can reach) the job then asks every server to check at once
-(`POST /check`, no authentication) and waits until its `GET /status` reports the release (`code.version`), so
-`post_deploy.yml` tests the new release. It fails when a server reports the release in `code.failed_version`, or
-after `DEPLOY_WEBHOOK_TIMEOUT`. Without `DEPUTY_URLS` the job ends after the tag moved, and the release goes live
-within the watch interval, so `post_deploy.yml` may still test the previous one.
-
-Switch an environment from the webhook to watch: run deputy with `watch.enabled`, then delete
-`DEPLOY_WEBHOOK_URL` on that environment.
-
-### Deploy webhook contract
-
-`POST DEPLOY_WEBHOOK_URL`, body (compact JSON, signed bytes):
-
-```json
-{"environment":"staging","tag_name":"v1.2.0-alpha.1","tag":"v1.2.0-alpha.1","artifact_digest":"sha256:<hex>","timestamp":1760000000}
-```
-
-`tag` is the image tag in `OCI_REPOSITORY`; magenx-deputy-go (`deploy.source: oci`) names the release dir after it.
-
-Headers: `X-Webhook-Secret`, `X-Signature: sha256=<HMAC-SHA256(body, SIGNATURE_HMAC_KEY)>`, `X-Timestamp`
-(same value as body `timestamp`). Receiver: [magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go)
-(`webhook_secret` = `DEPLOY_WEBHOOK_SECRET`, `hmac_key` = `SIGNATURE_HMAC_KEY`, `brand`/`domain` from its config).
-The server must verify secret and signature, reject old timestamps, pull `<OCI_REPOSITORY>:<tag>`, check the
-layer against `artifact_digest` and the image signature, and deploy.
-
-magenx-deputy-go answers after deploy and health check, so `deploy.yml` waits
-(`DEPLOY_WEBHOOK_TIMEOUT`, default 960 s, keep above deputy `deployment_timeout_seconds`) and
-`post_deploy.yml` runs right after. The webhook is never retried: a retry would deploy twice.
-
-An asynchronous receiver should instead answer immediately and call back when done:
-
-```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" \
-  https://api.github.com/repos/OWNER/REPO/dispatches \
-  -d '{"event_type":"deployment_completed","client_payload":{"environment":"staging","tag_name":"v1.2.0-alpha.1"}}'
-```
-
-The callback token needs only Contents: write on this repository (fine-grained PAT or App).
+(`POST /check`, no authentication, rate limited) and waits until its `GET /status` reports the release
+(`code.version`), so `post_deploy.yml` tests the new release. It fails when a server reports the release in
+`code.failed_version`, or after `DEPUTY_WAIT_TIMEOUT`. Without `DEPUTY_URLS` the job ends after the tag moved,
+and the release goes live within the watch interval, so `post_deploy.yml` may still test the previous one.
 
 ### OCI registry
 
 `deploy.yml` (`.github/actions/oci-release`) pushes the verified release archive
-as an image whose only layer is the archive itself (`crane append`), so the layer digest is the archive's sha256,
-the webhook `artifact_digest`:
+as an image whose only layer is the archive itself (`crane append`), so the layer digest is the archive's sha256:
 
 1. `<OCI_REPOSITORY>:<tag>`, annotated `org.opencontainers.image.version=<tag>`: the pre-release tag for
    staging, the release tag for production. Both manifests hold the same layer, so promotion uploads no bytes
@@ -183,8 +148,8 @@ the webhook `artifact_digest`:
    Use the key pair of the docker configuration repository (the same `COSIGN_PRIVATE_KEY` / `COSIGN_PASSWORD`,
    e.g. as organization secrets): one public key, its `cosign/cosign.pub`, then verifies the images, the stack
    bundle and the Magento releases. One pair per customer keeps customers apart; one provider pair can sign for all
-3. after a successful webhook deploy, the moving tag `staging` or `production` points to it: new servers
-   deploy it with `magenx-deputy-go bootstrap -tag production`
+3. the moving tag `staging` or `production` then points to it: deputy watch deploys it, new servers
+   start with `magenx-deputy-go bootstrap -tag production`
 
 Server side ([magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go), OCI registry source):
 
@@ -195,6 +160,9 @@ deploy:
   source: oci
   oci_repository: ghcr.io/acme/magento-release
   cosign_public_key: /etc/magenx-deputy-go/cosign.pub   # cosign/cosign.pub of the docker configuration repository
+watch:
+  enabled: true
+  code_tag: production                   # staging on staging servers
 ```
 
 The job logs in with `GITHUB_TOKEN` (`packages: write`). A package created by this workflow is linked to
@@ -229,7 +197,7 @@ Fixed:
 - production deploy downloaded from the wrong run id and sent empty artifact url/digest
   (`artifact-url` vs `artifact_url` outputs); now build once, promote verified bytes.
 - AWS keys were written to `$GITHUB_ENV`; secrets and payload were interpolated into shell scripts;
-  webhook `curl` ignored HTTP errors.
+  webhook `curl` ignored HTTP errors (the webhook is gone: deputy follows the environment tag).
 - composer-diff flagged a Magento update on every PR, so `composer update -W` always ran; push-back
   failed with "nothing to commit" on re-runs.
 - upgrade PR title `feat!(upgrade):` was invalid and PRs opened by `GITHUB_TOKEN` never ran checks.
@@ -240,5 +208,5 @@ Fixed:
 Removed: Hyva/Luma build, PageSpeed action, HTML ZAP baseline, theme/less/css/phtml labels,
 Magento base files and 1.4 MB changelog.
 
-Added: PR CI, build provenance attestation, sha256 verification, OIDC, reusable deploy,
+Added: PR CI, build provenance attestation, sha256 verification, reusable deploy to a signed OCI image,
 GraphQL/REST smoke test, ZAP GraphQL scan, least-privilege `permissions` everywhere.

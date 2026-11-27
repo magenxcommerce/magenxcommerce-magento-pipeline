@@ -1,7 +1,7 @@
 #!/bin/bash
 # Push a release archive to an OCI registry the way magenx-deputy-go (deploy.source: oci) reads it:
 # one image manifest whose only layer is the archive itself, so the layer digest is the archive's sha256
-# (the webhook's artifact_digest), annotated org.opencontainers.image.version=<tag> and signed with cosign.
+# (the sha256 deputy checks), annotated org.opencontainers.image.version=<tag> and signed with cosign.
 # Idempotent: a tag that already holds the archive is not pushed again, a signature that verifies is kept.
 #
 # Environment: OCI_REPOSITORY (registry/owner/name), TAG_NAME, ARCHIVE (path), SHA256 (hex),
