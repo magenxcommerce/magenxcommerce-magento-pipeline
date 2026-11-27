@@ -71,7 +71,6 @@ jobs:
     needs: promote
     permissions:
       contents: read
-      id-token: write
       attestations: read
       issues: write
       pull-requests: write

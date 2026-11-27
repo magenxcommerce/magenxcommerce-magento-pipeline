@@ -1,0 +1,32 @@
+name: "Wait for magenx-deputy-go"
+author: "MagenX"
+description: >-
+  After the environment tag moved: ask each magenx-deputy-go (watch mode) to check the tag now and wait until its
+  /status reports the release as deployed. Fails when a server reports the release as failed, or on timeout.
+
+inputs:
+  urls:
+    description: "Base URLs of the servers' deputy, space or comma separated (e.g. http://10.1.0.4:8082)"
+    required: true
+  tag:
+    description: "The release that must be deployed"
+    required: true
+  target:
+    description: "code or stack"
+    required: true
+  timeout:
+    description: "Seconds to wait for every server"
+    required: false
+    default: "960"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Wait for deputy
+      shell: bash
+      env:
+        DEPUTY_URLS: ${{ inputs.urls }}
+        TAG_NAME: ${{ inputs.tag }}
+        TARGET: ${{ inputs.target }}
+        WAIT_TIMEOUT: ${{ inputs.timeout }}
+      run: bash "${GITHUB_ACTION_PATH}/deputy-wait.sh"
