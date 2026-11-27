@@ -94,7 +94,11 @@ jobs:
           cosign-private-key: ${{ secrets.COSIGN_PRIVATE_KEY }}
           cosign-password: ${{ secrets.COSIGN_PASSWORD }}
 
-      # magenx-deputy-go pulls <OCI_REPOSITORY>:<tag> and checks it against artifact_digest and the signature
+      # Two ways to deploy, per environment:
+      # - webhook (secret DEPLOY_WEBHOOK_URL set): deputy pulls <OCI_REPOSITORY>:<tag>, checks it against
+      #   artifact_digest and the signature and answers after the deploy; then the environment tag moves
+      # - watch (no DEPLOY_WEBHOOK_URL): moving the environment tag is the deploy; deputy follows the tag, and with
+      #   variable DEPUTY_URLS the job asks the servers to check now and waits for their /status
       - name: Trigger signed deployment webhook
         id: deployment-webhook
         env:
@@ -105,6 +109,12 @@ jobs:
           # keep above deputy deployment_timeout_seconds (default 900)
           WEBHOOK_TIMEOUT: ${{ vars.DEPLOY_WEBHOOK_TIMEOUT || '960' }}
         run: |
+          if [ -z "${DEPLOY_WEBHOOK_URL}" ]; then
+            echo "no DEPLOY_WEBHOOK_URL: deputy watch deploys after the ${DEPLOY_ENV} tag moved"
+            echo "used=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "used=true" >> "${GITHUB_OUTPUT}"
           timestamp="$(date -u +%s)"
           # deploy.source oci: deputy names the release dir after the tag
           jq -cn \
@@ -130,6 +140,16 @@ jobs:
           OCI_REPOSITORY: ${{ vars.OCI_REPOSITORY }}
         run: crane tag "${OCI_REPOSITORY}:${TAG_NAME}" "${DEPLOY_ENV}"
 
+      - name: Wait for deputy watch
+        id: deputy-wait
+        if: ${{ steps.deployment-webhook.outputs.used == 'false' && vars.DEPUTY_URLS != '' }}
+        uses: ./.github/actions/deputy-wait
+        with:
+          urls: ${{ vars.DEPUTY_URLS }}
+          tag: ${{ inputs.tag_name }}
+          target: code
+          timeout: ${{ vars.DEPLOY_WEBHOOK_TIMEOUT || '960' }}
+
       - name: Deployment status message
         id: deployment-status-comment
         if: ${{ !cancelled() }}
@@ -137,8 +157,9 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           DOWNLOAD: ${{ steps.artifact-download.outcome }}
           OCI_PUSH: ${{ steps.oci-push.outcome }}
-          WEBHOOK: ${{ steps.deployment-webhook.outcome }}
+          WEBHOOK: ${{ steps.deployment-webhook.outputs.used == 'false' && 'skipped' || steps.deployment-webhook.outcome }}
           OCI_TAG: ${{ steps.oci-tag.outcome }}
+          WAIT: ${{ steps.deputy-wait.outcome }}
           ASSET: ${{ steps.artifact-download.outputs.asset }}
           OCI_REPOSITORY: ${{ vars.OCI_REPOSITORY }}
           MANIFEST: ${{ steps.oci-push.outputs.manifest-digest }}
@@ -151,6 +172,7 @@ jobs:
             row "Push and sign release in OCI registry" "${OCI_PUSH}"
             row "Deployment event webhook trigger" "${WEBHOOK}"
             row "Move ${DEPLOY_ENV} tag" "${OCI_TAG}"
+            row "Deputy watch deployed it (DEPUTY_URLS)" "${WAIT}"
             echo
             echo "- **ARTIFACT**: \`${ASSET}\`"
             if [ -n "${MANIFEST}" ]; then

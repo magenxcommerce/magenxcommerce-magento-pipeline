@@ -23,14 +23,14 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
                                               ├─ static deploy: adminhtml, plus email theme CSS only
                                               ├─ eComscan, tar.gz + sha256, build provenance attestation
                                               ├─ assets attached to the pre-release
-                                              └─ deploy.yml (staging) ──► signed OCI image + signed webhook
+                                              └─ deploy.yml (staging) ──► signed OCI image, staging tag (+ webhook)
           release.yml opens release PR (status comments: build, deploy, smoke)
                                    │ test staging; merge release PR
                                    ▼
           release tag vX.Y.Z ──► promote.yml
                                    ├─ download pre-release asset, verify sha256 + attestation
                                    ├─ attach the same bytes to the release (no rebuild)
-                                   └─ deploy.yml (production, environment approval) ──► signed OCI image + webhook
+                                   └─ deploy.yml (production, environment approval) ──► signed OCI image, production tag (+ webhook)
           after each deploy ──► post_deploy.yml: GraphQL/REST smoke test, ZAP API scan (staging)
 ```
 
@@ -58,7 +58,7 @@ feature PR ──► CI (lint, phpcs, composer validate/audit, di:compile, tests
 | `release.yml` | push to main | release-please pre-release PR/tag, then release PR |
 | `build.yml` | pre-release published | build once, attest, attach artifact, deploy staging |
 | `promote.yml` | release published / manual | reuse verified pre-release artifact, deploy production |
-| `deploy.yml` | reusable / manual redeploy | verify artifact, push signed image to `OCI_REPOSITORY`, signed webhook, move the environment tag, status PR comment or issue |
+| `deploy.yml` | reusable / manual redeploy | verify artifact, push signed image to `OCI_REPOSITORY`, signed webhook (optional), move the environment tag, wait for deputy watch (optional), status PR comment or issue |
 | `post_deploy.yml` | after deploy (reusable) / `repository_dispatch: deployment_completed` / manual | GraphQL + REST smoke test, ZAP GraphQL API scan |
 | `composer_outdated.yml` | weekly | issue with outdated direct packages |
 | `upgrade.yml` | manual | upgrade `magento/product-community-edition`, open PR |
@@ -92,7 +92,8 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `ECOMSCAN_SHA256` | empty | optional eComscan binary checksum |
 | `OCI_REPOSITORY` | required | deploy: the image repository of the releases, e.g. `ghcr.io/acme/magento-release` (see [OCI registry](#oci-registry)) |
 | `DEPLOY_ISSUE_ASSIGNEE` | empty | production deployment issue assignee |
-| `DEPLOY_WEBHOOK_TIMEOUT` | `960` | seconds to wait for synchronous webhook deploy |
+| `DEPLOY_WEBHOOK_TIMEOUT` | `960` | seconds to wait for the webhook deploy, or for every server of `DEPUTY_URLS` |
+| `DEPUTY_URLS` | empty | watch only: base URLs of the servers' deputy (`http://10.1.0.4:8082`, space or comma separated), see [Deploy with deputy watch](#deploy-with-deputy-watch) |
 | `GRAPHQL_URL_STAGING`, `GRAPHQL_URL_PRODUCTION` | | post-deploy checks, e.g. `https://api.example.com/graphql` |
 | `GRAPHQL_SMOKE_QUERY` | `{ storeConfig { store_code base_currency_code } }` | post-deploy |
 | `STORE_CODE` | `default` | post-deploy `Store` header |
@@ -107,8 +108,8 @@ repository only) in secret `MAGENX_CI_GITHUB_TOKEN` (same name as the old pipeli
 | `COMPOSER_AUTH` | `{"http-basic":{"repo.magento.com":{"username":"<public>","password":"<private>"}}}` |
 | `CI_APP_PRIVATE_KEY` or `MAGENX_CI_GITHUB_TOKEN` | see GitHub App |
 | `ECOMSCAN_KEY` | build security scan (skipped when empty) |
-| `DEPLOY_WEBHOOK_URL`, `SIGNATURE_HMAC_KEY` | deploy webhook |
-| `DEPLOY_WEBHOOK_SECRET` | `X-Webhook-Secret` header, required by magenx-deputy-go |
+| `DEPLOY_WEBHOOK_URL`, `SIGNATURE_HMAC_KEY` | deploy webhook; without `DEPLOY_WEBHOOK_URL` the environment tag is the deploy (deputy watch) |
+| `DEPLOY_WEBHOOK_SECRET` | `X-Webhook-Secret` header, required by the magenx-deputy-go webhook |
 | `COSIGN_PRIVATE_KEY`, `COSIGN_PASSWORD` | sign the release image: the same key pair as the docker configuration repository, whose public key is its committed `cosign/cosign.pub` (see [OCI registry](#oci-registry)) |
 | `COPILOT_TOKEN` | Copilot review request |
 
@@ -118,6 +119,24 @@ Store deploy secrets as **environment secrets** on `staging` / `production` wher
 
 Create `staging` and `production`. On `production` add required reviewers and restrict to tags
 `v*`; this gives an explicit, audited approval before production deploy.
+
+### Deploy with deputy watch
+
+Without the secret `DEPLOY_WEBHOOK_URL` (on the environment), moving the environment tag is the deploy:
+[magenx-deputy-go](https://github.com/magenxcommerce/magenx-deputy-go) with `watch.enabled` follows
+`<OCI_REPOSITORY>:staging` or `:production` and deploys a new release on its own, from a `HEAD` of the tag every
+`watch.interval_seconds`. No webhook secrets, no inbound connection from GitHub runners, no server list: a new
+server follows the tag from its first start. The production approval still gates it: the tag only moves in the
+approved job.
+
+With variable `DEPUTY_URLS` (base URLs the runners can reach) the job then asks every server to check at once
+(`POST /check`, no authentication) and waits until its `GET /status` reports the release (`code.version`), so
+`post_deploy.yml` tests the new release. It fails when a server reports the release in `code.failed_version`, or
+after `DEPLOY_WEBHOOK_TIMEOUT`. Without `DEPUTY_URLS` the job ends after the tag moved, and the release goes live
+within the watch interval, so `post_deploy.yml` may still test the previous one.
+
+Switch an environment from the webhook to watch: run deputy with `watch.enabled`, then delete
+`DEPLOY_WEBHOOK_URL` on that environment.
 
 ### Deploy webhook contract
 
