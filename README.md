@@ -8,7 +8,9 @@ Successor of [magenx/Magento-2-deployment-pipeline](https://github.com/magenx/Ma
 stripped of storefront tooling (Luma, Hyva, PageSpeed) and hardened.
 
 Magento code is project specific: copy `.github/` (plus `.editorconfig`, `.gitignore`) into a Magento
-project repository and configure the variables and secrets below.
+project repository and configure the variables and secrets below. In this template repository itself
+`release.yml` and `composer_outdated.yml` are skipped (no Magento project, no release token); in a copy
+the repository name differs and they run.
 
 ## Release flow
 
